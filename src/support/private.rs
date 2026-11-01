@@ -161,12 +161,11 @@ fn check_owner(_file: &std::fs::File, _shown: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     #[test]
-    #[cfg(unix)]
     fn private_files_are_read_without_links_or_other_writers() {
         use std::os::unix::fs::PermissionsExt;
 
