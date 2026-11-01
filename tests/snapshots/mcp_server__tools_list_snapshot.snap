@@ -1,0 +1,132 @@
+---
+source: tests/mcp_server.rs
+expression: "reply[\"result\"]"
+---
+{
+  "tools": [
+    {
+      "name": "code_map",
+      "description": "Ranked map of a project's key files and their signatures. Use it first in an unfamiliar area, before grep or opening files. focus narrows it to a path prefix.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository you are working in (its git root)"
+          },
+          "focus": {
+            "type": "string",
+            "description": "Path prefix to centre the map on, such as src/api"
+          },
+          "budget": {
+            "type": "integer",
+            "default": 700,
+            "description": "Size of the map in tokens, 200 to 4000 (a value outside is cut to the nearest end)"
+          }
+        },
+        "required": [
+          "project_path"
+        ],
+        "additionalProperties": false
+      },
+      "_meta": {
+        "anthropic/alwaysLoad": true
+      }
+    },
+    {
+      "name": "code_symbol",
+      "description": "Where a function, type or constant (or a file's definitions) is defined, what it uses and who uses it, with file:line and the call-site source line. Prefer it to grep. `(by name)` and `?` mark weak links.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository you are working in (its git root)"
+          },
+          "symbol": {
+            "type": "string",
+            "description": "name, Type::name, module::name, path/fragment::name or a file path"
+          },
+          "limit": {
+            "type": "integer",
+            "default": 20,
+            "description": "Entries per list, 1 to 50 (a value outside is cut to the nearest end)"
+          }
+        },
+        "required": [
+          "project_path",
+          "symbol"
+        ],
+        "additionalProperties": false
+      },
+      "_meta": {
+        "anthropic/alwaysLoad": true
+      }
+    },
+    {
+      "name": "code_impact",
+      "description": "Everything that depends on a symbol or a file, by caller depth, as caller → callee. Use it before changing a signature or behaviour. `(by name)` and `?` mark weak links.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository you are working in (its git root)"
+          },
+          "symbol": {
+            "type": "string",
+            "description": "name, Type::name, module::name, path/fragment::name or a file path"
+          },
+          "depth": {
+            "type": "integer",
+            "default": 2,
+            "description": "Caller hops, 1 to 4 (a value outside is cut to the nearest end)"
+          }
+        },
+        "required": [
+          "project_path",
+          "symbol"
+        ],
+        "additionalProperties": false
+      },
+      "_meta": {
+        "anthropic/alwaysLoad": true
+      }
+    },
+    {
+      "name": "code_path",
+      "description": "How A reaches B: the shortest chain of calls, renders, shared constants and name links, with call-site file:line and source. Ends: symbol, file, command or plain words. If you grepped for a start, call this from there.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_path": {
+            "type": "string",
+            "description": "Absolute path of the repository you are working in (its git root)"
+          },
+          "from": {
+            "type": "string",
+            "description": "Where the chain starts: a symbol (name, Type::name, path/fragment::name), a file path, a command or event name, or plain words of the question"
+          },
+          "to": {
+            "type": "string",
+            "description": "Where the chain ends, written the same way"
+          },
+          "max_depth": {
+            "type": "integer",
+            "default": 8,
+            "description": "Longest chain in hops, 1 to 10 (a value outside is cut to the nearest end)"
+          }
+        },
+        "required": [
+          "project_path",
+          "from",
+          "to"
+        ],
+        "additionalProperties": false
+      },
+      "_meta": {
+        "anthropic/alwaysLoad": true
+      }
+    }
+  ]
+}

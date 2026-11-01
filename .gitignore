@@ -1,0 +1,8 @@
+target/
+node_modules/
+*.log
+.DS_Store
+
+# Private benchmark repositories (paths, goldens, tasks): local only, never committed.
+/bench/local.toml
+/bench/local/

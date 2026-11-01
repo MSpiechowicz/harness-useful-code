@@ -1,0 +1,19 @@
+{
+  "name": "harness-code",
+  "version": "0.0.0",
+  "description": "Harness Code: a local stdio MCP server that maps a repository's files and symbols for coding agents",
+  "license": "GPL-3.0-or-later",
+  "private": true,
+  "type": "module",
+  "repository": "https://github.com/MSpiechowicz/harness-useful-code",
+  "scripts": {
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@semantic-release/changelog": "^7.0.0",
+    "@semantic-release/exec": "^7.1.0",
+    "@semantic-release/git": "^11.0.1",
+    "@types/bun": "^1.4.4",
+    "semantic-release": "^25.0.9"
+  }
+}

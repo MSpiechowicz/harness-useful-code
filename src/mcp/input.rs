@@ -1,0 +1,198 @@
+//! The server's input, read on a thread of its own so that a running index build can be stopped while
+//! the server waits for it ([`Stop`]):
+//!
+//! - the client cancels the request (`notifications/cancelled` with its `requestId`): the build
+//!   is stopped and the request gets no answer, as the MCP spec asks;
+//! - the input ends (the client closed it, the MCP way to shut a server down): the build running
+//!   then is stopped, and so is any build a request still waiting asks for;
+//! - (on Unix) the server gets SIGTERM or SIGINT ([`stop_on_sigterm`]): the build is stopped and the
+//!   server stops serving, or ends the process after two seconds if it is busy with something else.
+//!
+//! Lines reach the serving loop in the order they were read; a cancel that arrives before its
+//! request started still stops it (the last [`MAX_EARLY_CANCELS`] are kept).
+
+use std::io::{self, BufRead};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread;
+
+use serde_json::Value;
+
+use super::protocol::{self, Line};
+use crate::limits::LINE_MAX;
+use crate::support::Stop;
+
+/// How many cancels of requests that have not started yet are kept.
+const MAX_EARLY_CANCELS: usize = 64;
+
+/// The method of a cancel.
+const CANCELLED: &str = "notifications/cancelled";
+
+/// The request running now and the cancels that came before their request started.
+#[derive(Debug, Default)]
+struct Requests {
+    running: Option<Value>,
+    early: Vec<Value>,
+}
+
+/// Tells the [`Stop`] of a server what its input says about the request running now.
+#[derive(Debug)]
+pub(super) struct Watch {
+    stop: Stop,
+    requests: Mutex<Requests>,
+}
+
+impl Watch {
+    pub(super) fn new(stop: Stop) -> Arc<Self> {
+        Arc::new(Self {
+            stop,
+            requests: Mutex::new(Requests::default()),
+        })
+    }
+
+    fn requests(&self) -> std::sync::MutexGuard<'_, Requests> {
+        self.requests.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Request `id` starts (`None`: a notification).
+    pub(super) fn begin(&self, id: Option<&Value>) {
+        let mut requests = self.requests();
+        self.stop.begin();
+
+        let early = id.and_then(|id| requests.early.iter().position(|cancelled| cancelled == id));
+
+        if let Some(at) = early {
+            requests.early.remove(at);
+            self.stop.cancel();
+        }
+
+        requests.running = id.cloned();
+    }
+
+    /// The request that ran is done: true when the client cancelled it (it gets no answer).
+    pub(super) fn finish(&self) -> bool {
+        self.requests().running = None;
+        self.stop.is_cancelled()
+    }
+
+    /// Looks at one line read: a cancel stops its request, now or when it starts.
+    fn saw(&self, line: &[u8]) {
+        if !line
+            .windows(CANCELLED.len())
+            .any(|window| window == CANCELLED.as_bytes())
+        {
+            return;
+        }
+
+        let Ok(message) = serde_json::from_slice::<Value>(line) else {
+            return;
+        };
+
+        if message.get("method").and_then(Value::as_str) != Some(CANCELLED) || message.get("id").is_some() {
+            return;
+        }
+
+        let Some(id) = message.pointer("/params/requestId") else {
+            return;
+        };
+
+        let mut requests = self.requests();
+
+        if requests.running.as_ref() == Some(id) {
+            self.stop.cancel();
+            return;
+        }
+
+        if requests.early.len() == MAX_EARLY_CANCELS {
+            requests.early.remove(0);
+        }
+
+        requests.early.push(id.clone());
+    }
+}
+
+/// Reads `reader` line by line on a thread of its own and sends each line to `lines`, until the
+/// input ends (also sent), reading fails (sent too) or nobody takes the lines any more.
+pub(super) fn spawn_reader<R: BufRead + Send + 'static>(
+    mut reader: R,
+    watch: Arc<Watch>,
+    lines: Sender<io::Result<Line>>,
+) {
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+
+        loop {
+            let line = protocol::read_line(&mut reader, &mut buffer, LINE_MAX);
+            let more = matches!(line, Ok(Line::Text(_) | Line::TooLong));
+
+            if let Ok(Line::Text(text)) = &line {
+                watch.saw(text);
+            }
+
+            if !more {
+                watch.stop.end();
+            }
+
+            if lines.send(line).is_err() || !more {
+                return;
+            }
+        }
+    });
+}
+
+/// How long the server may take to end after its first SIGTERM or SIGINT before the process exits anyway.
+#[cfg(unix)]
+const EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Makes SIGTERM and SIGINT stop `stop` ([`Stop::terminate`]) instead of ending the process at once, so a
+/// running build is stopped first. A computation that does not look at `stop` (a big
+/// index build, a stuck neighbour) would ignore that, so the process exits [`EXIT_GRACE`] after the first
+/// signal if it has not ended by then (a transaction still open is rolled back with the process), and at
+/// once on a second one. Blocks both signals in the calling thread and every thread it starts afterwards,
+/// and waits for them on a thread of its own. A child process inherits the blocked signals (the standard
+/// library does not clear the signal mask): the code index worker unblocks them itself, and git is ended with
+/// SIGKILL, which cannot be blocked. Call it first thing, before anything starts a thread.
+#[cfg(unix)]
+pub fn stop_on_sigterm(stop: &Stop) {
+    use nix::sys::signal::{SigSet, Signal};
+
+    let mut set = SigSet::empty();
+    set.add(Signal::SIGTERM);
+    set.add(Signal::SIGINT);
+
+    if set.thread_block().is_err() {
+        return;
+    }
+
+    let stop = stop.clone();
+
+    thread::spawn(move || {
+        let mut signalled = false;
+
+        loop {
+            let signal = match set.wait() {
+                Ok(signal @ (Signal::SIGTERM | Signal::SIGINT)) => signal,
+                Ok(_) => continue,
+                Err(_) => return,
+            };
+            // the status a shell shows for a process ended by that signal
+            let status = 128 + signal as i32;
+
+            if signalled {
+                std::process::exit(status);
+            }
+
+            signalled = true;
+            stop.terminate();
+
+            thread::spawn(move || {
+                thread::sleep(EXIT_GRACE);
+                std::process::exit(status);
+            });
+        }
+    });
+}
+
+/// SIGTERM ends the process as usual (Windows has none).
+#[cfg(not(unix))]
+pub fn stop_on_sigterm(_stop: &Stop) {}

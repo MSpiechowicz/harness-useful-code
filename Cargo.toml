@@ -1,0 +1,69 @@
+[package]
+name = "harness_code"
+description = "Code graph MCP server for any coding agent harness (embedded SQLite, tree-sitter)"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.98"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/MSpiechowicz/harness-useful-code"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# The stdio MCP server the harnesses' `mcp.json` entries start (`harness-code` or `harness-code mcp`).
+[[bin]]
+name = "harness-code"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+# SQLite compiled in, so no system library is needed.
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+# `preserve_order`: tool schemas and replies keep their keys in source order.
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+thiserror = "2.0.21"
+# The SHA-256 of a file the code index read.
+sha2 = "0.11.1"
+# The secret patterns `support::redact` masks in replies.
+regex = "1.13"
+# Canonical paths without the Windows `\\?\` prefix.
+dunce = "1.0.5"
+# The switch file (`code.toml`) and the package manifests the code index reads.
+toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
+# The temporary file of an atomic private write.
+tempfile = "3.27.0"
+# Returns the freed memory to the operating system (glibc keeps it) and lets the worker's address
+# space reserve be set in small steps (`MIMALLOC_ARENA_RESERVE`, see `src/code/supervise.rs`).
+mimalloc = "0.1"
+# The code index (`src/code`): tree-sitter parsers for the languages it reads, and the repository walker that
+# honours `.gitignore` and never follows links.
+tree-sitter = "0.27.1"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-go = "0.25.0"
+tree-sitter-python = "0.25.0"
+ignore = "0.4.34"
+
+# Kills a timed-out git together with its process group (`killpg`), and tells the user a file belongs to.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["signal", "process", "user"] }
+# The open flags (`O_NOFOLLOW`) of the code index's reads of an untrusted repository.
+libc = "0.2"
+# The memory and CPU limits of the code index worker process (`src/code/worker.rs`).
+rlimit = "0.11.0"
+
+[dev-dependencies]
+insta = { version = "1.49.0", features = ["json"] }
+pretty_assertions = "1.4"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = 3
+strip = true
