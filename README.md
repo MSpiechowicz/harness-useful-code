@@ -11,8 +11,8 @@
 [MCP](https://modelcontextprotocol.io) server that Claude Code, Codex, OMP, PI, OpenCode and any other
 MCP client can start. It indexes a repository with tree-sitter and answers where code is defined, who
 uses it, what breaks when it changes and how one thing reaches another, so an agent reads the answer
-instead of grepping and opening files. It is the code side of the Harness family: `harness-memory` keeps
-what agents learn, `harness-knowledge` keeps what is written down, and `harness-code` knows the code.
+instead of grepping and opening files. It is the code side of the Harness family: [`harness-memory`](https://github.com/MSpiechowicz/harness-useful-memory) keeps
+what agents learn, [`harness-knowledge`](https://github.com/MSpiechowicz/harness-useful-knowledge) keeps what is written down, and `harness-code` knows the code.
 It works on its own, with neither of the others installed.
 
 The index is a local SQLite file. Nothing is sent anywhere.
