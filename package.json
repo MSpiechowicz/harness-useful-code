@@ -1,6 +1,6 @@
 {
   "name": "harness-code",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "Harness Code: a local stdio MCP server that maps a repository's files and symbols for coding agents",
   "license": "GPL-3.0-or-later",
   "private": true,
