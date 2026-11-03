@@ -1,3 +1,10 @@
+# [1.2.0](https://github.com/MSpiechowicz/harness-useful-code/compare/v1.1.0...v1.2.0) (2026-11-03)
+
+
+### Features
+
+* **code:** centre code_map on a query ([c697259](https://github.com/MSpiechowicz/harness-useful-code/commit/c6972593e2b2d7f5434bd0260915cb5e67b8ef92))
+
 # [1.1.0](https://github.com/MSpiechowicz/harness-useful-code/compare/v1.0.0...v1.1.0) (2026-11-03)
 
 
