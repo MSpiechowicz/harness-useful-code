@@ -45,6 +45,7 @@ tree-sitter-typescript = "0.23.2"
 tree-sitter-go = "0.25.0"
 tree-sitter-python = "0.25.0"
 ignore = "0.4.34"
+tree-sitter-scss-modern = "0.1.1"
 
 # Kills a timed-out git together with its process group (`killpg`), and tells the user a file belongs to.
 [target.'cfg(unix)'.dependencies]

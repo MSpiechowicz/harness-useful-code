@@ -223,6 +223,41 @@ fn a_namespace_call_follows_a_barrel_and_drops_what_the_module_lacks() {
     );
 }
 
+// ---- stylesheets ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_stylesheet_token_is_used_through_its_module_namespace_or_by_name() {
+    let mut repo = Repo::new();
+
+    repo.write(
+        "src/styles/_tokens.scss",
+        "$gap: 4px;\n:root { --ds-color: #fff; }\n@mixin box { padding: $gap; }\n",
+    );
+    repo.write("src/styles/_other.scss", "$gap: 8px;\n");
+    repo.write(
+        "src/ui/dropdown.scss",
+        "@use \"../styles/tokens\" as t;\n@use \"sass:math\";\n.dropdown { margin: t.$gap; color: var(--ds-color); @include t.box; width: math.div(1, 2); }\n",
+    );
+    repo.write("src/ui/plain.css", ".menu { color: var(--ds-color); }\n");
+
+    let gap = repo.symbol("src/styles/_tokens.scss::$gap");
+    let token = repo.symbol("--ds-color");
+    let mixin = repo.symbol("box");
+
+    assert!(gap.contains("src/ui/dropdown.scss:3 .dropdown"), "{gap}");
+    assert!(
+        gap.contains("src/styles/_tokens.scss:3 box"),
+        "the mixin reads it by name: {gap}"
+    );
+    assert!(!repo.symbol("src/styles/_other.scss::$gap").contains("dropdown.scss"));
+    assert!(token.contains("src/ui/dropdown.scss:3 .dropdown"), "{token}");
+    assert!(
+        token.contains("src/ui/plain.css:1 .menu"),
+        "css is read like scss: {token}"
+    );
+    assert!(mixin.contains("src/ui/dropdown.scss:3 .dropdown"), "{mixin}");
+}
+
 // ---- imports no config explains ------------------------------------------------------------------------
 
 #[test]

@@ -19,6 +19,7 @@ mod go;
 mod literals;
 mod python;
 mod rust;
+mod scss;
 mod sfc;
 mod sfc_template;
 mod tags;
@@ -313,6 +314,11 @@ pub static LANGS: &[LangSpec] = &[
         name: "python",
         exts: &["py"],
         run: python::extract,
+    },
+    LangSpec {
+        name: "scss",
+        exts: &["scss", "css"],
+        run: scss::extract,
     },
 ];
 

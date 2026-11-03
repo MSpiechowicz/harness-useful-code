@@ -46,6 +46,7 @@ mod python;
 mod rank;
 mod render;
 mod rust;
+mod scss;
 mod site;
 mod site_scan;
 #[cfg(test)]
@@ -312,6 +313,7 @@ fn rules(lang: &str) -> Option<&'static dyn Rules> {
         "ts" => Some(&ts::RULES),
         "go" => Some(&go::RULES),
         "python" => Some(&python::RULES),
+        "scss" => Some(&scss::RULES),
         _ => None,
     }
 }
