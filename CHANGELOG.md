@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/MSpiechowicz/harness-useful-code/compare/v1.0.0...v1.1.0) (2026-11-03)
+
+
+### Features
+
+* **code:** index SCSS and CSS in the code graph ([5f93640](https://github.com/MSpiechowicz/harness-useful-code/commit/5f93640fe2b52bfffeee7953d8a8ced1f7ef5d21))
+
 # 1.0.0 (2026-11-01)
 
 
