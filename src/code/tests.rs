@@ -122,7 +122,7 @@ fn an_empty_project_is_an_empty_graph_not_an_error() {
     let root = fixture.repo.path().to_path_buf();
     let (graph, _) = fixture.index.graph(&root, &|| false).expect("graph");
 
-    assert!(graph.map(700, None).contains("No source files"));
+    assert!(graph.map(700, None, None).contains("No source files"));
     assert!(
         graph
             .impact("anything", 2)
@@ -626,7 +626,7 @@ fn the_map_lists_central_files_first_and_leaves_tests_out() {
 
     let root = fixture.repo.path().to_path_buf();
     let (graph, _) = fixture.index.graph(&root, &|| false).expect("graph");
-    let map = graph.map(700, None);
+    let map = graph.map(700, None, None);
 
     assert!(map.starts_with("src/core.rs\n  pub fn central_fn() {}"), "{map}");
     assert!(!map.contains("tests/it.rs"));
@@ -1304,7 +1304,7 @@ fn name_only_method_matches_count_less_in_the_map_than_typed_ones() {
 
     let root = fixture.repo.path().to_path_buf();
     let (graph, _) = fixture.index.graph(&root, &|| false).expect("graph");
-    let map = graph.map(700, None);
+    let map = graph.map(700, None, None);
     let order: Vec<&str> = map.lines().filter(|l| !l.starts_with(' ')).collect();
     let hub = order.iter().position(|f| *f == "src/hub.ts").expect("hub");
     let noisy = order.iter().position(|f| *f == "src/noisy.ts");

@@ -391,7 +391,7 @@ fn check_impact(graph: &Graph, fact: &ImpactFact, report: &mut Report) {
 }
 
 fn check_map(graph: &Graph, fact: &MapFact, report: &mut Report) {
-    let text = graph.map(fact.budget.unwrap_or(DEFAULT_BUDGET), fact.focus.as_deref());
+    let text = graph.map(fact.budget.unwrap_or(DEFAULT_BUDGET), fact.focus.as_deref(), None);
     let files = map_files(&text);
     let top: Vec<&str> = files.iter().copied().take(fact.top.unwrap_or(files.len())).collect();
     let scope = fact.top.map_or_else(|| "map".to_string(), |n| format!("map top {n}"));
@@ -639,7 +639,7 @@ fn fixture_output(name: &str) -> String {
     let (graph, _) = index
         .graph(&root.canonicalize().expect("canonical"), &|| false)
         .expect("index");
-    let mut out = format!("== map\n{}", graph.map(4000, None));
+    let mut out = format!("== map\n{}", graph.map(4000, None, None));
     let mut symbols: Vec<&str> = facts.symbol.iter().map(|f| f.query.as_str()).collect();
 
     symbols.sort_unstable();

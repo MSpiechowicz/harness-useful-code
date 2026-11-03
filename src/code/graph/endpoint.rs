@@ -15,6 +15,8 @@
 //! A name that is a symbol stays a symbol whatever else it names. The answer says which reading was used
 //! whenever the end holds more than one definition.
 
+use std::collections::HashMap;
+
 use super::{Graph, shown};
 use crate::code::extract;
 
@@ -30,6 +32,9 @@ const MAX_MENTION_ENDS: usize = 64;
 
 /// Definitions or places named in a note.
 const NOTE_LISTED: usize = 4;
+
+/// Definitions of a query that centre a map: the best ones of words, which are guesses.
+const MAX_MAP_SEEDS: usize = 12;
 
 /// What an end of a query was taken for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -84,10 +89,99 @@ impl Endpoint {
     }
 }
 
+/// What a `code_map` query names: the definitions, the files that hold them, and the files that use them.
+pub(super) struct MapSeeds {
+    pub files: Vec<usize>,
+    /// The definitions the query names; for a file, all of its definitions.
+    pub syms: Vec<usize>,
+    /// The files (not among `files`, no tests) that use what the query names, the most references first.
+    pub callers: Vec<usize>,
+}
+
 impl Graph {
+    /// The files and definitions a `code_map` query (a symbol, a file, a string or words) stands for, tests left
+    /// out, and only those under `prefix` when there is one.
+    pub(super) fn map_seeds(&self, query: &str, prefix: Option<&str>) -> MapSeeds {
+        // what is outside the prefix is left out before a reading cuts its list: the one definition under the focus
+        // may be the least used
+        let end = self.endpoint_in(query, usize::MAX, prefix);
+        let live = |file: usize| self.files.get(file).is_some_and(|f| !f.test);
+        let under = |file: usize| {
+            live(file) && prefix.is_none_or(|prefix| self.files.get(file).is_some_and(|f| f.path.starts_with(prefix)))
+        };
+        let (files, syms): (Vec<usize>, Vec<usize>) = if end.reading == Reading::File {
+            let files: Vec<usize> = self
+                .files_named(query, prefix)
+                .into_iter()
+                .filter(|file| under(*file))
+                .collect();
+            let syms = files
+                .iter()
+                .filter_map(|file| self.file_syms.get(*file))
+                .flatten()
+                .copied()
+                .filter(|sym| self.syms.get(*sym).is_some_and(|s| !s.test))
+                .collect();
+
+            (files, syms)
+        } else {
+            let mut named: Vec<usize> = end
+                .syms
+                .iter()
+                .copied()
+                .filter(|sym| self.syms.get(*sym).is_some_and(|s| !s.test && under(s.file)))
+                .collect();
+            let mut files: Vec<usize> = Vec::new();
+
+            named.truncate(MAX_MAP_SEEDS);
+
+            for file in named.iter().filter_map(|sym| self.syms.get(*sym)).map(|s| s.file) {
+                if !files.contains(&file) {
+                    files.push(file);
+                }
+            }
+
+            (files, named)
+        };
+
+        // who uses what is named: the ranking runs from users to what they use, so these get no rank from it
+        let mut uses: HashMap<usize, usize> = HashMap::new();
+
+        for sym in &syms {
+            for ri in self.incoming.get(*sym).map(Vec::as_slice).unwrap_or(&[]) {
+                if let Some(file) = self
+                    .refs
+                    .get(*ri)
+                    .map(|r| r.file)
+                    .filter(|f| live(*f) && !files.contains(f))
+                {
+                    *uses.entry(file).or_default() += 1;
+                }
+            }
+        }
+
+        let mut callers: Vec<(usize, usize)> = uses.into_iter().collect();
+
+        callers.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        MapSeeds {
+            files,
+            syms,
+            callers: callers.into_iter().map(|(file, _)| file).collect(),
+        }
+    }
+
     /// The end `query` names. A symbol keeps at most `symbols` of its definitions (the most used first).
     pub(super) fn endpoint(&self, query: &str, symbols: usize) -> Endpoint {
+        self.endpoint_in(query, symbols, None)
+    }
+
+    /// [`Graph::endpoint`] of what is under the path prefix `scope` alone: the candidates outside it are left out
+    /// before any reading cuts its list, so the one definition that is under it is not lost to better ones elsewhere.
+    pub(super) fn endpoint_in(&self, query: &str, symbols: usize, scope: Option<&str>) -> Endpoint {
         let mut found = self.find(query);
+
+        found.retain(|sym| self.syms.get(*sym).is_some_and(|s| self.in_scope(s.file, scope)));
 
         if !found.is_empty() {
             let total = found.len();
@@ -116,27 +210,32 @@ impl Graph {
             };
         }
 
-        let files = self.files_named(query);
+        let files = self.files_named(query, scope);
 
         if !files.is_empty() {
             return self.file_endpoint(query, &files);
         }
 
-        let text = self.text_endpoint(query);
+        let text = self.text_endpoint(query, scope);
 
         if !text.is_empty() {
             return text;
         }
 
-        self.words_endpoint(query)
+        self.words_endpoint(query, scope)
+    }
+
+    /// True when `file` is under the path prefix `scope`, or there is none.
+    pub(super) fn in_scope(&self, file: usize, scope: Option<&str>) -> bool {
+        scope.is_none_or(|prefix| self.files.get(file).is_some_and(|f| f.path.starts_with(prefix)))
     }
 
     /// The files a text may mean: the one with that path, else the (few) files whose path ends with it.
-    fn files_named(&self, query: &str) -> Vec<usize> {
+    fn files_named(&self, query: &str, scope: Option<&str>) -> Vec<usize> {
         let readings = self.readings(query);
 
         for reading in &readings {
-            if let Some(&file) = self.path_idx.get(reading) {
+            if let Some(&file) = self.path_idx.get(reading).filter(|file| self.in_scope(**file, scope)) {
                 return vec![file];
             }
         }
@@ -152,9 +251,10 @@ impl Graph {
 
         let mut files: Vec<usize> = (0..self.files.len())
             .filter(|file| {
-                self.files.get(*file).is_some_and(|f| {
-                    f.path == written || f.path.strip_suffix(written).is_some_and(|before| before.ends_with('/'))
-                })
+                self.in_scope(*file, scope)
+                    && self.files.get(*file).is_some_and(|f| {
+                        f.path == written || f.path.strip_suffix(written).is_some_and(|before| before.ends_with('/'))
+                    })
             })
             .collect();
 
@@ -222,11 +322,15 @@ impl Graph {
     }
 
     /// A string written in the code that names no definition: the definitions that write it.
-    fn text_endpoint(&self, query: &str) -> Endpoint {
+    fn text_endpoint(&self, query: &str, scope: Option<&str>) -> Endpoint {
         let Some(places) = self.loose.get(query) else {
             return Endpoint::none();
         };
-        let mut syms: Vec<usize> = places.iter().filter_map(|place| place.from).collect();
+        let mut syms: Vec<usize> = places
+            .iter()
+            .filter_map(|place| place.from)
+            .filter(|sym| self.syms.get(*sym).is_some_and(|s| self.in_scope(s.file, scope)))
+            .collect();
 
         syms.sort_by_key(|sym| (self.syms.get(*sym).is_some_and(|s| s.test), *sym));
         syms.dedup();

@@ -48,6 +48,7 @@ pub(super) fn switched_on(server: &Server) -> bool {
 struct MapArgs {
     project_path: String,
     focus: Option<String>,
+    query: Option<String>,
     budget: Option<i64>,
 }
 
@@ -103,9 +104,18 @@ fn map(server: &mut Server, arguments: Value) -> Result<String, String> {
         .filter(|focus| !focus.is_empty())
         .map(|focus| short_enough("focus", focus))
         .transpose()?;
+    let query = args
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .map(|query| short_enough("query", query))
+        .transpose()?;
     let budget = bounded(args.budget, MAP_BUDGET_DEFAULT, MAP_BUDGET_MIN, MAP_BUDGET_MAX);
 
-    answer(server, "code_map", &args.project_path, |graph| graph.map(budget, focus))
+    answer(server, "code_map", &args.project_path, |graph| {
+        graph.map(budget, focus, query)
+    })
 }
 
 fn symbol(server: &mut Server, arguments: Value) -> Result<String, String> {

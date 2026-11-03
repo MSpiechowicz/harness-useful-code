@@ -13,6 +13,15 @@ const ITERATIONS: usize = 30;
 /// name like `add` or `get` matches every class that has it, so it says little about who depends on whom.
 const SOFT_WEIGHT: f64 = 0.2;
 
+/// What the ranking is centred on.
+#[derive(Clone, Copy)]
+pub(super) enum Focus<'a> {
+    /// The files under a path prefix.
+    Prefix(&'a str),
+    /// These files (by index), such as the ones that define what a query names.
+    Files(&'a [usize]),
+}
+
 /// File and symbol scores.
 pub(super) struct Ranks {
     /// Per file.
@@ -26,7 +35,7 @@ pub(super) struct Ranks {
 impl Graph {
     /// PageRank of the files (optionally personalised to a path prefix) and the share of it each symbol
     /// receives from other files.
-    pub(super) fn rank(&self, focus: Option<&str>) -> Ranks {
+    pub(super) fn rank(&self, focus: Option<Focus>) -> Ranks {
         match self.rank_paced(focus, &|| Ok(())) {
             Ok(ranks) => ranks,
             // `tick` of no check never fails
@@ -42,7 +51,7 @@ impl Graph {
     /// is spent stops there instead of running on.
     pub(super) fn rank_paced(
         &self,
-        focus: Option<&str>,
+        focus: Option<Focus>,
         tick: &dyn Fn() -> Result<(), String>,
     ) -> Result<Ranks, String> {
         let n = self.files.len();
@@ -52,10 +61,26 @@ impl Graph {
         // a test of its own would hand a small helper all of its rank. Under the focus everything counts: a map of
         // `scripts/` is a map of what the scripts use
         let copies = self.copied_files();
-        let focused = |path: &str| focus.is_some_and(|prefix| !prefix.is_empty() && path.starts_with(prefix));
+        let seeded: Vec<bool> = match focus {
+            Some(Focus::Prefix(prefix)) if !prefix.is_empty() => {
+                self.files.iter().map(|f| f.path.starts_with(prefix)).collect()
+            }
+            Some(Focus::Files(files)) => {
+                let mut seeded = vec![false; n];
+
+                for file in files {
+                    if let Some(slot) = seeded.get_mut(*file) {
+                        *slot = true;
+                    }
+                }
+
+                seeded
+            }
+            _ => vec![false; n],
+        };
         let counts = |file: usize| {
             self.files.get(file).is_some_and(|f| {
-                focused(&f.path)
+                seeded.get(file).copied().unwrap_or(false)
                     || (!f.test && !super::is_tooling_path(&f.path) && !copies.get(file).copied().unwrap_or(false))
             })
         };
@@ -111,16 +136,14 @@ impl Graph {
             }
         }
 
-        let teleport: Vec<f64> = match focus.filter(|prefix| !prefix.is_empty()) {
-            Some(prefix) => {
-                let hits = self.files.iter().filter(|f| f.path.starts_with(prefix)).count().max(1) as f64;
-
-                self.files
-                    .iter()
-                    .map(|f| if f.path.starts_with(prefix) { 1.0 / hits } else { 0.0 })
-                    .collect()
-            }
-            None => vec![1.0 / n.max(1) as f64; n],
+        let hits = seeded.iter().filter(|seed| **seed).count();
+        let teleport: Vec<f64> = if hits > 0 {
+            seeded
+                .iter()
+                .map(|seed| if *seed { 1.0 / hits as f64 } else { 0.0 })
+                .collect()
+        } else {
+            vec![1.0 / n.max(1) as f64; n]
         };
 
         let mut rank = teleport.clone();

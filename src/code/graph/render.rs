@@ -7,10 +7,14 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write;
 
 use super::endpoint::Reading;
+use super::rank::Focus;
 use super::{Graph, TYPE_KINDS, shown, tokens};
 
 /// Signatures listed per file in the map.
 const MAP_SIGNATURES: usize = 6;
+
+/// Files named in the line that says what a map is centred on.
+const MAP_SEED_FILES: usize = 4;
 
 /// Definitions shown for one symbol query.
 const MAX_DEFINITIONS: usize = 4;
@@ -54,10 +58,11 @@ const MAX_SUGGEST_QUERY: usize = 64;
 
 impl Graph {
     /// The most central source files with the signatures other code depends on, within `budget` tokens.
-    /// `focus` is a path prefix that centres the ranking on one area (see [`Graph::focus_prefix`]). Test
-    /// files are left out. When no definition is used by another file, each file lists its top definitions
+    /// `focus` is a path prefix that centres the ranking on one area (see [`Graph::focus_prefix`]); `query`, a
+    /// symbol, a file, a string or words (see `endpoint`), centres it on what that names, whose definitions are
+    /// listed even when no other file uses them. Test files are left out. When no definition is used by another file, each file lists its top definitions
     /// instead.
-    pub fn map(&self, budget: usize, focus: Option<&str>) -> String {
+    pub fn map(&self, budget: usize, focus: Option<&str>, query: Option<&str>) -> String {
         if self.files.is_empty() {
             return "No source files are indexed in this folder.\n".to_string();
         }
@@ -70,7 +75,48 @@ impl Graph {
             },
             None => None,
         };
-        let ranks = self.rank(prefix.as_deref());
+        let mut header = String::new();
+        let seeds = query
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .and_then(|query| {
+                let seeds = self.map_seeds(query, prefix.as_deref());
+
+                if seeds.files.is_empty() {
+                    let _ = writeln!(header, "nothing matches {}; map without it:", shown(query));
+
+                    return None;
+                }
+
+                let paths: Vec<&str> = seeds
+                    .files
+                    .iter()
+                    .take(MAP_SEED_FILES)
+                    .filter_map(|file| self.files.get(*file))
+                    .map(|file| file.path.as_str())
+                    .collect();
+                let more = seeds.files.len().saturating_sub(paths.len());
+
+                let _ = writeln!(
+                    header,
+                    "centred on {}: {}{}",
+                    shown(query),
+                    paths.join(", "),
+                    if more > 0 {
+                        format!(" and {more} more")
+                    } else {
+                        String::new()
+                    }
+                );
+
+                Some(seeds)
+            });
+        let seed_syms: HashSet<usize> = seeds.iter().flat_map(|seeds| seeds.syms.iter().copied()).collect();
+        let ranks = match (&seeds, prefix.as_deref()) {
+            (Some(seeds), _) => self.rank(Some(Focus::Files(&seeds.files))),
+            (None, Some(prefix)) => self.rank(Some(Focus::Prefix(prefix))),
+            (None, None) => self.rank(None),
+        };
         let linked = ranks.syms.iter().any(|rank| *rank > 0.0);
         // a file is central for the code that depends on it (its rank) and for the code it ties together: of two
         // files used alike, the one that uses more other files is the hub (`command-core.js` over `names.js`)
@@ -87,10 +133,26 @@ impl Graph {
             .filter(|f| self.files.get(*f).is_some_and(|file| !file.test) && !copy(*f))
             .collect();
 
-        // the code before the tooling around it (`scripts/`), then the most central first
+        let named = |f: usize| seeds.as_ref().is_some_and(|seeds| seeds.files.contains(&f));
+        // the files that use what the query names, the most references first (the ranking goes from users to what
+        // they use, so it gives them nothing)
+        let caller_at: HashMap<usize, usize> = seeds
+            .iter()
+            .flat_map(|seeds| seeds.callers.iter().copied().enumerate().map(|(at, file)| (file, at)))
+            .collect();
+
+        // what the query names, then who uses it, then the code before the tooling around it (`scripts/`), then the
+        // most central first
         order.sort_by(|a, b| {
-            tooling(*a)
-                .cmp(&tooling(*b))
+            named(*b)
+                .cmp(&named(*a))
+                .then_with(|| {
+                    caller_at
+                        .get(a)
+                        .unwrap_or(&usize::MAX)
+                        .cmp(caller_at.get(b).unwrap_or(&usize::MAX))
+                })
+                .then_with(|| tooling(*a).cmp(&tooling(*b)))
                 .then_with(|| score(*b).total_cmp(&score(*a)))
                 .then_with(|| {
                     self.files
@@ -114,15 +176,43 @@ impl Graph {
                 .map(|list| {
                     list.iter()
                         .copied()
-                        .filter(|s| (!linked || sym_rank(*s) > 0.0) && self.syms.get(*s).is_some_and(|sym| !sym.test))
+                        .filter(|s| {
+                            (!linked || sym_rank(*s) > 0.0 || seed_syms.contains(s))
+                                && self.syms.get(*s).is_some_and(|sym| !sym.test)
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
 
-            if linked {
-                symbols.sort_by(|a, b| sym_rank(*b).total_cmp(&sym_rank(*a)).then_with(|| a.cmp(b)));
+            if symbols.is_empty() && caller_at.contains_key(&file) {
+                // a file that uses what the query names has no rank to show its definitions by: list them as they are
+                symbols = self
+                    .file_syms
+                    .get(file)
+                    .map(|list| {
+                        list.iter()
+                            .copied()
+                            .filter(|s| self.syms.get(*s).is_some_and(|sym| !sym.test))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                symbols.sort_by_key(|s| self.definition_order(*s));
+            } else if linked {
+                // what the query names leads, then what other files use most
+                symbols.sort_by(|a, b| {
+                    seed_syms
+                        .contains(b)
+                        .cmp(&seed_syms.contains(a))
+                        .then_with(|| sym_rank(*b).total_cmp(&sym_rank(*a)))
+                        .then_with(|| a.cmp(b))
+                });
             } else {
                 symbols.sort_by_key(|s| self.definition_order(*s));
+            }
+
+            // under a query, a file that is neither named nor a user of it and shows nothing is only noise
+            if seeds.is_some() && symbols.is_empty() && !named(file) && !caller_at.contains_key(&file) {
+                continue;
             }
 
             let mut block = format!("{}\n", shown(&entry.path));
@@ -140,7 +230,7 @@ impl Graph {
                 let _ = writeln!(block, "  {owner}{}", shown(&sym.sig));
             }
 
-            if !out.is_empty() && tokens(&out) + tokens(&block) > budget {
+            if !out.is_empty() && tokens(&header) + tokens(&out) + tokens(&block) > budget {
                 break;
             }
 
@@ -169,7 +259,7 @@ impl Graph {
             out += &self.next_steps(&listed, &uses, |f| ranks.files.get(f).copied().unwrap_or(0.0));
         }
 
-        out
+        header + &out
     }
 
     /// The calls that go on from a map, with an example `code_path` between two of its files: agents asked how a

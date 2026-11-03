@@ -290,7 +290,7 @@ type Matches = HashMap<usize, Tiers>;
 
 impl Graph {
     /// The definitions the words of `query` point at, or nothing.
-    pub(super) fn words_endpoint(&self, query: &str) -> Endpoint {
+    pub(super) fn words_endpoint(&self, query: &str, scope: Option<&str>) -> Endpoint {
         let words = query_words(query);
 
         if words.is_empty() {
@@ -302,6 +302,9 @@ impl Graph {
         self.match_names(&words, &mut matches);
         self.match_literals(query, &words, &mut matches);
         self.match_paths(&words, &mut matches);
+
+        // what is outside the scope is left out before the lists are cut
+        matches.retain(|sym, _| self.syms.get(*sym).is_some_and(|s| self.in_scope(s.file, scope)));
 
         // a word that few definitions hold says more than one that many do
         let mut holders = [0_usize; MAX_QUERY_WORDS];

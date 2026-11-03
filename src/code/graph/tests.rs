@@ -84,7 +84,7 @@ fn paths_and_signatures_with_line_breaks_and_controls_are_written_out_in_every_a
     let answers = [
         graph.symbol("target_fn", 20),
         graph.impact("target_fn", 2),
-        graph.map(2000, None),
+        graph.map(2000, None, None),
         graph.path("call_it", "target_fn", 3),
     ];
 
@@ -320,7 +320,7 @@ fn a_focus_is_read_the_way_an_agent_writes_it() {
     let root = repo.dir.path().canonicalize().expect("canonical");
     let name = root.file_name().expect("name").to_string_lossy().into_owned();
     let graph = repo.graph();
-    let plain = graph.map(2000, Some("src/api"));
+    let plain = graph.map(2000, Some("src/api"), None);
 
     for written in [
         "./src/api".to_string(),
@@ -329,13 +329,158 @@ fn a_focus_is_read_the_way_an_agent_writes_it() {
         format!("{name}/src/api"),
         "  src/api  ".to_string(),
     ] {
-        assert_eq!(graph.map(2000, Some(&written)), plain, "focus `{written}`");
+        assert_eq!(graph.map(2000, Some(&written), None), plain, "focus `{written}`");
     }
 
     assert!(plain.starts_with("src/api/http.ts"), "{plain}");
     assert_eq!(
-        graph.map(2000, Some("nowhere/else")),
+        graph.map(2000, Some("nowhere/else"), None),
         "no indexed files under nowhere/else\n"
+    );
+}
+
+#[test]
+fn a_map_query_centres_the_map_on_what_the_task_names_and_not_on_the_hub_of_the_repository() {
+    let mut repo = Repo::new();
+
+    repo.write("src/util.ts", "export function log() {}\n");
+
+    for area in ["billing", "search", "mail", "auth"] {
+        repo.write(
+            &format!("src/{area}/{area}.ts"),
+            &format!("import {{ log }} from '../util';\nexport function {area}Run() {{ log(); }}\n"),
+        );
+    }
+
+    repo.write(
+        "src/checkout/cart.ts",
+        "export function retryCheckout() {}\nexport function totals() {}\n",
+    );
+    repo.write(
+        "src/checkout/pay.ts",
+        "import { totals } from './cart';\nexport function pay() { totals(); }\n",
+    );
+
+    let graph = repo.graph();
+    let plain = graph.map(4000, None, None);
+    let asked = graph.map(4000, None, Some("checkout retry"));
+
+    assert!(plain.starts_with("src/util.ts"), "the hub leads a plain map: {plain}");
+    assert!(
+        asked.starts_with("centred on checkout retry: src/checkout/cart.ts"),
+        "{asked}"
+    );
+    // nothing uses `retryCheckout`, but the query names it
+    assert!(asked.contains("function retryCheckout"), "{asked}");
+    assert!(
+        asked.find("src/checkout/cart.ts") < asked.find("src/util.ts"),
+        "the named file leads the hub: {asked}"
+    );
+    assert_eq!(graph.map(4000, None, Some("  ")), plain);
+    assert!(
+        graph
+            .map(4000, None, Some("zzqx"))
+            .starts_with("nothing matches zzqx; map without it:\n"),
+    );
+    assert!(
+        graph
+            .map(4000, Some("src/billing"), Some("checkout retry"))
+            .starts_with("nothing matches checkout retry; map without it:\n"),
+        "a query is read inside the focus only"
+    );
+}
+
+#[test]
+fn a_map_query_lists_the_signatures_of_a_named_file_and_the_files_that_use_what_it_names() {
+    let mut repo = Repo::new();
+
+    repo.write("src/dep.ts", "export function dep() {}\n");
+    repo.write(
+        "src/mid.ts",
+        "import { dep } from './dep';\nexport function midA() { dep(); }\nexport function midB() {}\n",
+    );
+    repo.write("src/aother.ts", "export function otherThing() {}\n");
+    repo.write(
+        "src/zz/caller.ts",
+        "import { midA } from '../mid';\nexport function callMid() { midA(); }\n",
+    );
+
+    let graph = repo.graph();
+    let file = graph.map(4000, None, Some("src/mid.ts"));
+
+    assert!(
+        file.contains("function midA") && file.contains("function midB"),
+        "a named file shows its definitions: {file}"
+    );
+
+    let symbol = graph.map(4000, None, Some("midA"));
+
+    assert!(
+        symbol.find("src/zz/caller.ts") < symbol.find("src/aother.ts") || !symbol.contains("src/aother.ts"),
+        "a user of the symbol comes before unrelated files: {symbol}"
+    );
+    assert!(
+        symbol.contains("function callMid"),
+        "a user of the symbol shows what it defines: {symbol}"
+    );
+    assert!(
+        !symbol.contains("src/aother.ts"),
+        "an unrelated file that shows nothing is left out: {symbol}"
+    );
+}
+
+#[test]
+fn a_map_query_finds_the_definition_under_the_focus_even_when_other_definitions_are_used_more() {
+    let mut repo = Repo::new();
+
+    for n in 0..14 {
+        repo.write(&format!("src/lib/l{n}.ts"), "export function run() {}\n");
+        repo.write(
+            &format!("src/lib/u{n}.ts"),
+            &format!("import {{ run }} from './l{n}';\nexport function use{n}() {{ run(); }}\n"),
+        );
+    }
+
+    repo.write("src/tgt/run.ts", "export function run() {}\n");
+
+    let map = repo.graph().map(4000, Some("src/tgt"), Some("run"));
+
+    assert!(map.starts_with("centred on run: src/tgt/run.ts"), "{map}");
+}
+
+#[test]
+fn a_map_query_of_a_file_name_or_words_is_read_inside_the_focus_before_any_list_is_cut() {
+    let mut repo = Repo::new();
+
+    for n in 0..10 {
+        repo.write(
+            &format!("src/m{n}/index.ts"),
+            &format!("export function entry{n}() {{}}\n"),
+        );
+        repo.write(
+            &format!("src/m{n}/checkout_retry_payment.ts"),
+            "export function checkoutRetryPayment() {}\n",
+        );
+        repo.write(
+            &format!("src/m{n}/use.ts"),
+            &format!("import {{ checkoutRetryPayment }} from './checkout_retry_payment';\nexport function use{n}() {{ checkoutRetryPayment(); }}\n"),
+        );
+    }
+
+    repo.write("src/deep/er/api/index.ts", "export function apiEntry() {}\n");
+    repo.write("src/deep/er/api/pay.ts", "export function checkoutRetryPayment() {}\n");
+
+    let graph = repo.graph();
+    let by_file = graph.map(4000, Some("src/deep"), Some("index.ts"));
+    let by_words = graph.map(4000, Some("src/deep"), Some("checkout retry payment"));
+
+    assert!(
+        by_file.starts_with("centred on index.ts: src/deep/er/api/index.ts"),
+        "{by_file}"
+    );
+    assert!(
+        by_words.starts_with("centred on checkout retry payment: src/deep/er/api/pay.ts"),
+        "{by_words}"
     );
 }
 
@@ -349,7 +494,7 @@ fn a_map_of_files_that_use_nothing_of_each_other_still_shows_their_definitions()
     );
     repo.write("src/b.rs", "pub fn lone() {}\n");
 
-    let map = repo.graph().map(2000, None);
+    let map = repo.graph().map(2000, None, None);
 
     assert!(map.contains("src/a.ts\n"), "{map}");
     assert!(map.contains("class Zed"), "types first: {map}");
@@ -387,7 +532,7 @@ fn a_map_ranks_what_the_code_depends_on_and_leaves_out_copies_and_tooling_last()
         "import { core } from '../src/core';\n\nexport function build() {\n  return core();\n}\n",
     );
 
-    let map = repo.graph().map(4000, None);
+    let map = repo.graph().map(4000, None, None);
     let core = map.find("src/core.ts\n").expect("core");
     let helper = map.find("src/helper.ts\n").expect("helper");
     let script = map.find("scripts/build.ts\n").expect("build");
@@ -416,7 +561,7 @@ fn a_map_focused_on_tooling_follows_what_it_uses_and_empty_files_are_no_copies()
     repo.write("utils/__init__.py", "");
 
     // the script's use of core counts under its own focus: core leads the code
-    let map = repo.graph().map(4000, Some("scripts"));
+    let map = repo.graph().map(4000, Some("scripts"), None);
     let core = map.find("src/core.ts\n").expect("core");
     let alpha = map.find("src/alpha.ts\n").expect("alpha");
 
@@ -445,7 +590,7 @@ fn a_bundle_built_from_the_sources_is_not_indexed() {
     assert!(symbol.contains("src/core.ts"), "{symbol}");
     assert!(!symbol.contains("extension.js"), "{symbol}");
     assert!(
-        !graph.map(4000, None).contains("extension.js"),
+        !graph.map(4000, None, None).contains("extension.js"),
         "the map leaves the bundle out"
     );
 }

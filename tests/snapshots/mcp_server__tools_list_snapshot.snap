@@ -6,13 +6,17 @@ expression: "reply[\"result\"]"
   "tools": [
     {
       "name": "code_map",
-      "description": "Ranked map of a project's key files and their signatures. Use it first in an unfamiliar area, before grep or opening files. focus narrows it to a path prefix.",
+      "description": "Ranked map of a project's key files and signatures. Use it first in an unfamiliar area. query centres it on the task (symbol, file or words); focus on a path prefix.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "project_path": {
             "type": "string",
             "description": "Absolute path of the repository you are working in (its git root)"
+          },
+          "query": {
+            "type": "string",
+            "description": "What the task is about: a symbol, a file path, or words (`checkout retry`). The map is centred on the definitions and files it names instead of on the whole repository"
           },
           "focus": {
             "type": "string",

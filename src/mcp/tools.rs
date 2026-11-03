@@ -23,7 +23,7 @@ pub(super) const PATH_DEPTH_DEFAULT: i64 = 8;
 pub(super) const PATH_DEPTH_MIN: i64 = 1;
 pub(super) const PATH_DEPTH_MAX: i64 = 10;
 
-/// The longest `symbol`, `focus`, `from` or `to` accepted, in characters.
+/// The longest `symbol`, `query`, `focus`, `from` or `to` accepted, in characters.
 pub(super) const QUERY_CHARS_MAX: usize = 300;
 
 /// Sent in the `initialize` result while the code graph is on.
@@ -59,10 +59,14 @@ pub fn definitions(code_on: bool) -> Value {
 fn code_map() -> Value {
     tool(
         "code_map",
-        "Ranked map of a project's key files and their signatures. Use it first in an unfamiliar area, before \
-         grep or opening files. focus narrows it to a path prefix.",
+        "Ranked map of a project's key files and signatures. Use it first in an unfamiliar area. query centres it on \
+         the task (symbol, file or words); focus on a path prefix.",
         json!({
             "project_path": project_path(),
+            "query": text(
+                "What the task is about: a symbol, a file path, or words (`checkout retry`). The map is centred on \
+                 the definitions and files it names instead of on the whole repository",
+            ),
             "focus": text("Path prefix to centre the map on, such as src/api"),
             "budget": ranged(
                 MAP_BUDGET_DEFAULT,
