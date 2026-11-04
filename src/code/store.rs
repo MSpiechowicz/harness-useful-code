@@ -45,7 +45,10 @@ use super::walk::{Entry, TOO_LARGE};
 /// value (`siteContent.en`), whatever its case; an index of 15 lacks those references, so it is built again.
 /// 17: a name a component imports is a `use` or `call` reference where its template expressions use it
 /// (`{alternatePath(locale)}`, `{{ format(x) }}`); an index of 16 lacks those references, so it is built again.
-pub const SCHEMA_VERSION: i64 = 17;
+/// 18: the index `refs_from_symbol`: dropping a file cascades from its symbols to the references made from them,
+/// and without it each deleted symbol scanned every reference of every repository (minutes for a few hundred
+/// changed files). An index of 17 lacks it, so it is built again.
+pub const SCHEMA_VERSION: i64 = 18;
 
 /// The refusal of a file written by a newer harness-code.
 pub const NEWER: &str = "the code index was written by a newer harness-code";
@@ -121,6 +124,7 @@ CREATE TABLE IF NOT EXISTS builds(
 CREATE INDEX IF NOT EXISTS symbols_name ON symbols(repo_id, name);
 CREATE INDEX IF NOT EXISTS symbols_file ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS refs_file ON refs(file_id);
+CREATE INDEX IF NOT EXISTS refs_from_symbol ON refs(from_symbol);
 CREATE INDEX IF NOT EXISTS binds_file ON binds(file_id);
 CREATE INDEX IF NOT EXISTS imports_file ON imports(file_id);
 CREATE INDEX IF NOT EXISTS packages_repo ON packages(repo_id);

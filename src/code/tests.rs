@@ -578,6 +578,68 @@ fn a_cancelled_build_rolls_back_cleanly_and_the_next_call_finishes_it() {
 }
 
 #[test]
+fn a_cancelled_build_keeps_the_slices_it_committed_and_the_call_that_goes_on_gets_a_row_of_its_own() {
+    let mut fixture = Fixture::new();
+
+    // every file is a slice of its own
+    fixture.index.slice = Duration::ZERO;
+
+    for n in 0..10 {
+        fixture.write(&format!("src/f{n}.rs"), &format!("pub fn g{n}_fn() {{}}\n"));
+    }
+
+    let root = fixture.repo.path().to_path_buf();
+    let calls = Cell::new(0_usize);
+    // 24 polls before the first file, two for each file: the third one is cancelled
+    let stop = || {
+        calls.set(calls.get() + 1);
+        calls.get() > 28
+    };
+    let outcome = fixture.index.graph_observed(&root, &stop, &mut Recorder::default());
+
+    assert_eq!(outcome.err().as_deref(), Some(CANCELLED));
+
+    // the two files read before the cancel were committed, the one in flight was not
+    let kept: i64 = fixture
+        .index
+        .store
+        .conn()
+        .query_row("SELECT count(*) FROM files", [], |row| row.get(0))
+        .expect("files");
+
+    assert_eq!(kept, 2);
+
+    // eight files are left, far below a bulk build, and still the call that goes on is a build of its own
+    let mut recorder = Recorder::default();
+
+    fixture
+        .index
+        .graph_observed(&root, &|| false, &mut recorder)
+        .expect("graph");
+
+    assert!(
+        recorder.events.first().is_some_and(|e| e.ends_with("full 8")),
+        "{:?}",
+        recorder.events
+    );
+    assert_eq!(recorder.events.last().map(String::as_str), Some("finish ok"));
+
+    let rows: String = fixture
+        .index
+        .store
+        .conn()
+        .query_row(
+            "SELECT group_concat(kind || ':' || status, ',') FROM builds",
+            [],
+            |row| row.get(0),
+        )
+        .expect("builds");
+
+    assert_eq!(rows, "full:error,full:ok");
+    assert_eq!(fixture.counts().files, 10);
+}
+
+#[test]
 fn only_the_three_most_recent_repositories_keep_a_graph() {
     let mut fixture = Fixture::new();
     let repos: Vec<tempfile::TempDir> = (0..4)

@@ -30,7 +30,7 @@ memory or knowledge and other members (Knowledge auto-links, #49) can reuse it.
 | --- | --- |
 | Binary | `harness-code` (`harness-code.exe`), installs to `~/.local/bin` / `%LOCALAPPDATA%\Programs\harness-code\` |
 | Data folder | `<data>/harness-code/` (`$XDG_DATA_HOME` or `~/.local/share`, `~/Library/Application Support`, `%LOCALAPPDATA%`), override `HARNESS_CODE_DIR` |
-| Files | `code.sqlite3` (schema as memory v2.11 user_version 17, restarted at 1), `code.toml` (`enabled = true\|false`), `code-builds/<16 hex>.json` |
+| Files | `code.sqlite3` (schema as memory v2.11 user_version 18, restarted at 1), `code.toml` (`enabled = true\|false`), `code-builds/<16 hex>.json` |
 | Env | `HARNESS_CODE_INDEX` (0\|1 switch override), `HARNESS_CODE_INPROCESS`, `HARNESS_CODE_BUDGET_MS`, `HARNESS_CODE_GRACE_MS` (captured), debug `HARNESS_CODE_BIN` |
 | MCP | `harness-code` or `harness-code mcp`, server name `harness-code`, tools `code_map`, `code_symbol`, `code_impact`, `code_path` (all `_meta anthropic/alwaysLoad`) |
 | CLI | `status\|enable\|disable [--json]`, `hint --project P --query TEXT [--json]`, `repo\|build --project P [--json]`, `match --project P [--name N]... [--path P]... --json`, `features`, `--version`, internal `code-worker` |
@@ -45,7 +45,7 @@ As built (package C):
   200 symbols. Names match exactly (`Type::name` too), paths exactly or as a suffix after `/`.
 - Switch off: `tools/list` is empty and the off text points to Harness Desktop → Settings → Code.
 - Extra env: `HARNESS_CODE_WORKER_MEMORY_MB`, test-only `HARNESS_CODE_WORKER_TEST`. The pid file `code-worker.pid` is
-  debug only. Schema `user_version` stays 17.
+  debug only. Schema `user_version` is 18.
 - `TEAM_VARS` also strips the memory and knowledge database variables from git and the worker.
 
 ## Work packages

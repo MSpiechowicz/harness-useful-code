@@ -98,6 +98,8 @@ pub struct CodeIndex {
     budget: Duration,
     /// The most rows of each kind one repository may hold.
     caps: Caps,
+    /// How long a build reads before it commits (see [`refresh::COMMIT_SLICE`]).
+    slice: Duration,
     /// Most recently used first, at most [`CACHED_ROOTS`] and [`CACHE_BYTES`] in all.
     cache: VecDeque<Cached>,
     /// Indexes in a process of its own when set (see [`CodeIndex::set_worker`]).
@@ -115,6 +117,7 @@ impl CodeIndex {
             store: Store::open(path)?,
             budget: pace::BUDGET,
             caps: Caps::default(),
+            slice: refresh::COMMIT_SLICE,
             cache: VecDeque::new(),
             worker: None,
             data: path.parent().map(Path::to_path_buf).unwrap_or_default(),
@@ -317,7 +320,7 @@ impl CodeIndex {
     ) -> Result<Outcome, String> {
         match &self.worker {
             Some(worker) => self.supervised(worker, root, key, pace, attempt, begun),
-            None => refresh::run(&self.store, root, key, pace, self.caps, observer),
+            None => refresh::run(&self.store, root, key, pace, self.caps, self.slice, observer),
         }
     }
 
@@ -508,7 +511,7 @@ impl CodeIndex {
         let started = Instant::now();
         let key = root_key(root)?;
         let pace = Pace::new(stop, self.budget);
-        let mut outcome = refresh::run(&self.store, root, &key, &pace, self.caps, observer)?;
+        let mut outcome = refresh::run(&self.store, root, &key, &pace, self.caps, self.slice, observer)?;
 
         between();
 

@@ -24,6 +24,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::builds::{GAVE_UP, INTERRUPTED};
 use super::store::{digest_hex, now};
 use super::{BuildKind, BuildObserver, TOO_SLOW};
 use crate::support::private::{private_folder, read_private, write_atomic};
@@ -308,7 +309,7 @@ fn mark_interrupted(data: &Path, path: &Path, ids: &[i64]) {
 
     document["phase"] = Value::from("error");
     document["finishedAt"] = Value::from(now());
-    document["error"] = Value::from("the build was interrupted");
+    document["error"] = Value::from(INTERRUPTED);
 
     if let Ok(bytes) = serde_json::to_vec(&document)
         && let Err(message) = write_atomic(&data.join(FOLDER), path, &bytes, "build", "code build status")
@@ -322,8 +323,9 @@ pub fn building_id(data: &Path, root: &Path) -> Option<i64> {
     StatusFile::new(data, root).building().map(|earlier| earlier.build_id)
 }
 
-/// Turns the status file `path` into `ready` when it still says `building` the build `owner` (a session that
-/// shared that build finished the work, and the owner may be dead).
+/// Turns the status file `path` into `ready` when it still says `building` the build `owner`, or `error`
+/// because the owner gave up early (a session that shared that build finished the work, and the owner may be
+/// dead).
 pub fn finish_joined(data: &Path, path: &Path, owner: i64) {
     let Ok(Some(bytes)) = read_private(path, READ_MAX) else {
         return;
@@ -332,8 +334,16 @@ pub fn finish_joined(data: &Path, path: &Path, owner: i64) {
         return;
     };
     let theirs = document.get("buildId").and_then(Value::as_i64) == Some(owner);
+    let open = match document.get("phase").and_then(Value::as_str) {
+        Some("building") => true,
+        Some("error") => document
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| GAVE_UP.contains(&error)),
+        _ => false,
+    };
 
-    if document.get("phase").and_then(Value::as_str) != Some("building") || !theirs {
+    if !open || !theirs {
         return;
     }
 
@@ -342,6 +352,7 @@ pub fn finish_joined(data: &Path, path: &Path, owner: i64) {
     document["phase"] = Value::from("ready");
     document["filesDone"] = total;
     document["finishedAt"] = Value::from(now());
+    document["error"] = Value::Null;
 
     if let Ok(bytes) = serde_json::to_vec(&document)
         && let Err(message) = write_atomic(&data.join(FOLDER), path, &bytes, "build", "code build status")
@@ -486,6 +497,39 @@ mod tests {
         assert_eq!(done["phase"], "ready");
         assert_eq!(done["filesDone"], 300);
         assert!(done["finishedAt"].is_i64());
+    }
+
+    #[test]
+    fn a_session_that_finished_the_work_clears_an_owner_that_gave_up_but_not_another_failure() {
+        let data = tempfile::tempdir().expect("data");
+        let root = Path::new("/work/app");
+        let mut owner = StatusFile::new(data.path(), root);
+
+        owner.on_start(7, BuildKind::Bulk, 300);
+        owner.on_finish(Err("cancelled"));
+
+        let mut joined = StatusFile::new(data.path(), root);
+
+        assert_eq!(read(&joined.path())["phase"], "error");
+
+        joined.on_joined_finish(7);
+
+        let done = read(&joined.path());
+
+        assert_eq!(
+            (done["phase"].as_str(), done["filesDone"].as_i64()),
+            (Some("ready"), Some(300))
+        );
+        assert!(done["error"].is_null());
+
+        // a failure held against the repository stays what it was
+        let mut broken = StatusFile::new(data.path(), root);
+
+        broken.on_start(9, BuildKind::Bulk, 300);
+        broken.on_finish(Err("a file the parser cannot read"));
+        joined.on_joined_finish(9);
+
+        assert_eq!(read(&joined.path())["phase"], "error");
     }
 
     #[test]

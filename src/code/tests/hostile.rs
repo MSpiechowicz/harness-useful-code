@@ -296,7 +296,7 @@ fn the_second_session_serves_the_last_committed_graph_while_the_first_holds_the_
 }
 
 #[test]
-fn a_build_that_died_is_ended_as_an_error_and_its_status_file_stops_saying_building() {
+fn a_build_that_died_is_ended_as_an_error_and_the_call_that_goes_on_leaves_its_status_file_ready() {
     let mut fixture = Fixture::new();
 
     fixture.write("src/lib.rs", "pub fn alpha() {}\n");
@@ -358,10 +358,11 @@ fn a_build_that_died_is_ended_as_an_error_and_its_status_file_stops_saying_build
         .expect("rows");
     let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).expect("file")).expect("json");
 
-    assert!(rows.contains("error:the build was interrupted"), "{rows}");
-    assert!(!rows.contains("running"), "{rows}");
-    assert_eq!(document["phase"], "error");
-    assert_eq!(document["error"], "the build was interrupted");
+    // the corpse ends as an error; the call that found it goes on with the rest, a build of its own, so the
+    // file ends `ready` over a complete index instead of keeping the error
+    assert_eq!(rows, "ok:,error:the build was interrupted,ok:");
+    assert_eq!(document["phase"], "ready");
+    assert!(document["error"].is_null());
 }
 
 #[test]

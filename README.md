@@ -113,7 +113,9 @@ and `.astro` files, Go, Python, SCSS and CSS). It is on by default.
   function or component defined elsewhere. Replies mark it `(by name)`, and an uncertain edge `?`.
 
 **Build status.** A first index of a repository that has source files, or a refresh that touches 200 files
-or more at once (a branch switch), is a build. It writes `code-builds/<16 hex digits>.json` in the data
+or more at once (a branch switch), is a build. So is the rest of a build that gave up early (cancelled, out
+of time, its worker stopped), however few files are left; a build commits its work every few seconds, so a
+caller that gives up keeps what was read. It writes `code-builds/<16 hex digits>.json` in the data
 folder (mode 0600, replaced atomically), so Harness Desktop can show its progress:
 
 ```json

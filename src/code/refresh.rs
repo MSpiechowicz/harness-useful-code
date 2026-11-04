@@ -3,8 +3,9 @@
 //! 1. Walk without a lock and compare stamps (modification time and size). Nothing changed (manifests
 //!    included): nothing to do.
 //! 2. Otherwise take the write lock (`BEGIN IMMEDIATE`), walk again, reload the stamps, classify the
-//!    refresh with [`toast_kind`], read and write. A build commits every [`COMMIT_EVERY`] files so other
-//!    sessions wait only briefly; the stamps are reloaded after every commit, so a session that got in
+//!    refresh with [`toast_kind`], read and write. A build commits every [`COMMIT_EVERY`] files or
+//!    [`COMMIT_SLICE`], whichever comes first, so other sessions wait only briefly and a caller that gives up
+//!    keeps the work; the stamps are reloaded after every commit, so a session that got in
 //!    between shares the work instead of repeating it. The generation moves with every commit that wrote
 //!    something. A second process blocks on the busy timeout and then finds nothing left to do.
 //! 3. `stop` is checked between files; a cancelled refresh rolls back the batch in flight. A call that runs
@@ -18,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tree_sitter::Parser;
 
@@ -32,6 +33,10 @@ use super::walk::{self, Class, Entry, LIMITS, Read, Skipped, TOO_LARGE, Walked};
 
 /// A build commits after this many files.
 const COMMIT_EVERY: usize = 500;
+
+/// A build also commits after this long, so a caller that gives up early (an MCP client waits 30 seconds)
+/// keeps what was read and the next call goes on from there.
+pub(super) const COMMIT_SLICE: Duration = Duration::from_secs(5);
 
 /// What a refresh did.
 #[derive(Debug, Clone, Default)]
@@ -260,6 +265,7 @@ pub(super) fn run(
     key: &str,
     pace: &Pace,
     caps: Caps,
+    commit_slice: Duration,
     observer: &mut dyn BuildObserver,
 ) -> Result<Outcome, String> {
     let started = start(store, root, key, pace, None)?;
@@ -271,7 +277,17 @@ pub(super) fn run(
     let walked = started.walked;
     let mut build = None;
 
-    match locked(store, root, key, &walked, pace, caps, observer, &mut build) {
+    match locked(
+        store,
+        root,
+        key,
+        &walked,
+        pace,
+        caps,
+        commit_slice,
+        observer,
+        &mut build,
+    ) {
         Ok(outcome) => Ok(outcome),
         Err(message) => {
             let too_large = message == TOO_LARGE;
@@ -310,6 +326,7 @@ fn locked(
     seen: &Walked,
     pace: &Pace,
     caps: Caps,
+    commit_slice: Duration,
     observer: &mut dyn BuildObserver,
     build: &mut Option<(i64, BuildKind)>,
 ) -> Result<Outcome, String> {
@@ -396,7 +413,12 @@ fn locked(
             let indexed = known.files.values().filter(|stamp| stamp.lang != PACKAGE_LANG).count();
             let removed = plan.gone.iter().filter(|(_, is_manifest)| !is_manifest).count();
 
-            if let Some(kind) = toast_kind(indexed, sources, removed) {
+            // a call that goes on after a build gave up (cancelled, out of time, its worker stopped) is that
+            // build's rest, however few files are left: it gets a row of its own, so the last one does not
+            // keep saying `error` over a complete index
+            let kind = toast_kind(indexed, sources, removed).or(builds::unfinished(txn.conn(), repo).map_err(db)?);
+
+            if let Some(kind) = kind {
                 // another session's build is running: this call shares it instead of starting a second
                 if let Some(owner) = builds::running(txn.conn(), repo).map_err(db)? {
                     joined = Some(owner);
@@ -435,9 +457,20 @@ fn locked(
         };
         let (now, later) = plan.todo.split_at(batch);
 
-        work.apply(&txn, now, &plan.gone, &known.files, pace, observer, build.is_some())?;
+        // the batches that commit (a build, or a share of one) also end after a slice of time
+        let slice = (build.is_some() || joined.is_some()).then_some(commit_slice);
+        let applied = work.apply(
+            &txn,
+            now,
+            &plan.gone,
+            &known.files,
+            pace,
+            observer,
+            build.is_some(),
+            slice,
+        )?;
 
-        if later.is_empty() {
+        if applied == now.len() && later.is_empty() {
             break;
         }
 
@@ -524,7 +557,8 @@ struct Work {
 }
 
 impl Work {
-    /// Drops the missing files and reads and writes `entries`. The caller commits.
+    /// Drops the missing files and reads and writes `entries`, all of them or, with a `slice`, as many as fit in
+    /// it (at least one): the number it did. The caller commits.
     #[allow(clippy::too_many_arguments)]
     fn apply(
         &mut self,
@@ -535,7 +569,8 @@ impl Work {
         pace: &Pace,
         observer: &mut dyn BuildObserver,
         report: bool,
-    ) -> Result<(), String> {
+        slice: Option<Duration>,
+    ) -> Result<usize, String> {
         for (id, is_manifest) in gone {
             txn.drop_file(*id)?;
             self.removed += 1;
@@ -543,7 +578,15 @@ impl Work {
             self.wrote |= !is_manifest;
         }
 
-        for entry in entries {
+        let started = Instant::now();
+
+        for (index, entry) in entries.iter().enumerate() {
+            // a build hands the lock back and commits after a slice of time too: a batch that outlasts the
+            // caller's patience would be rolled back with it, and the next call would start from nothing
+            if index > 0 && slice.is_some_and(|slice| started.elapsed() >= slice) {
+                return Ok(index);
+            }
+
             pace.check()?;
 
             self.read_one(txn, entry, files.get(&entry.rel), pace)?;
@@ -558,7 +601,7 @@ impl Work {
             }
         }
 
-        Ok(())
+        Ok(entries.len())
     }
 
     fn read_one(&mut self, txn: &Txn, entry: &Entry, old: Option<&Stamp>, pace: &Pace) -> Result<(), String> {

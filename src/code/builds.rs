@@ -10,6 +10,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::store::now;
+use super::{CANCELLED, STOPPED, TOO_SLOW};
 
 /// A refresh that touches this many files or more (changed plus removed) is a bulk build.
 pub const BULK_THRESHOLD: usize = 200;
@@ -144,6 +145,33 @@ pub(super) fn running(conn: &Connection, repo: i64) -> rusqlite::Result<Option<i
     .optional()
 }
 
+/// The kind of the latest build of `repo` when it gave up early (cancelled, out of time, or its worker stopped
+/// or died) with files left, and nothing has built since: what its rest is, however few files are left. `None`
+/// for a build that ended `ok`, read every file, failed for another reason (a repository past the caps, a
+/// broken file) or never ran.
+pub(super) fn unfinished(conn: &Connection, repo: i64) -> rusqlite::Result<Option<BuildKind>> {
+    let row: Option<(String, String, Option<String>, i64, i64)> = conn
+        .query_row(
+            "SELECT kind, status, error, files_done, files_total FROM builds WHERE repo_id = ?1 \
+             ORDER BY id DESC LIMIT 1",
+            [repo],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+
+    Ok(row.and_then(|(kind, status, error, done, total)| {
+        let gave_up = status == "error" && done < total && error.as_deref().is_some_and(|e| GAVE_UP.contains(&e));
+
+        gave_up.then(|| BuildKind::parse(&kind)).flatten()
+    }))
+}
+
+/// What [`fail_stale`] says of a build whose process is gone.
+pub(super) const INTERRUPTED: &str = "the build was interrupted";
+
+/// The reasons that end a build early, with nothing held against the repository.
+pub(super) const GAVE_UP: [&str; 4] = [CANCELLED, TOO_SLOW, STOPPED, INTERRUPTED];
+
 /// A `running` build row older than this many seconds belongs to a process that is gone: a call ends within
 /// its time budget (two minutes). Where a process id can be looked up (Linux), a row whose process is gone is
 /// ended at once, however young.
@@ -223,8 +251,8 @@ pub(super) fn fail_stale(conn: &Connection, repo: i64) -> rusqlite::Result<Inter
         }
 
         conn.execute(
-            "UPDATE builds SET status = 'error', finished_at = ?2, error = 'the build was interrupted' WHERE id = ?1",
-            params![id, now()],
+            "UPDATE builds SET status = 'error', finished_at = ?2, error = ?3 WHERE id = ?1",
+            params![id, now(), INTERRUPTED],
         )?;
 
         if repo_id == repo {
@@ -262,11 +290,15 @@ pub(super) fn finish(conn: &Connection, id: i64, error: Option<&str>) -> rusqlit
 }
 
 /// A session that shared the build `owner` finished the work: the row, once it is no longer `running` (the
-/// owner ended it, or it was ended as interrupted), counts every file as done.
+/// owner ended it, or it was ended as interrupted), counts every file as done, and a row that says the owner
+/// gave up ends `ok`: the repository is complete.
 pub(super) fn complete_shared(conn: &Connection, owner: i64) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE builds SET files_done = files_total WHERE id = ?1 AND status != 'running'",
-        [owner],
+        "UPDATE builds SET files_done = files_total, \
+         status = CASE WHEN status = 'error' AND error IN (?2, ?3, ?4, ?5) THEN 'ok' ELSE status END, \
+         error = CASE WHEN status = 'error' AND error IN (?2, ?3, ?4, ?5) THEN NULL ELSE error END \
+         WHERE id = ?1 AND status != 'running'",
+        params![owner, GAVE_UP[0], GAVE_UP[1], GAVE_UP[2], GAVE_UP[3]],
     )
     .map(drop)
 }
@@ -302,6 +334,81 @@ mod tests {
     fn the_kind_names_are_the_stored_values() {
         assert_eq!(BuildKind::Full.as_str(), "full");
         assert_eq!(BuildKind::Bulk.as_str(), "bulk");
+    }
+
+    /// Inserts a build of `repo` with 3 of its 10 files read, and returns its id.
+    fn add(conn: &Connection, repo: i64, kind: &str, status: &str, error: Option<&str>) -> i64 {
+        conn.execute(
+            "INSERT INTO builds(repo_id, kind, status, started_at, error, files_total, files_done) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 10, 3)",
+            params![repo, kind, status, now(), error],
+        )
+        .expect("row");
+
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn a_build_that_gave_up_early_is_unfinished_until_another_build_ends_after_it() {
+        let conn = memory();
+
+        assert_eq!(unfinished(&conn, 1).expect("none"), None);
+
+        add(&conn, 1, "bulk", "error", Some(CANCELLED));
+        assert_eq!(unfinished(&conn, 1).expect("cancelled"), Some(BuildKind::Bulk));
+        // another repository's builds are not this one's
+        assert_eq!(unfinished(&conn, 2).expect("other repository"), None);
+
+        add(&conn, 1, "bulk", "error", Some(TOO_SLOW));
+        assert_eq!(unfinished(&conn, 1).expect("out of time"), Some(BuildKind::Bulk));
+
+        // a failure that is held against the repository is not a build to go on with
+        add(&conn, 1, "full", "error", Some("repository too large to index"));
+        assert_eq!(unfinished(&conn, 1).expect("too large"), None);
+
+        add(&conn, 1, "full", "error", Some(STOPPED));
+        assert_eq!(unfinished(&conn, 1).expect("stopped"), Some(BuildKind::Full));
+
+        add(&conn, 1, "full", "error", Some(INTERRUPTED));
+        assert_eq!(unfinished(&conn, 1).expect("interrupted"), Some(BuildKind::Full));
+
+        // one that read every file before it gave up has nothing left to go on with
+        let all = add(&conn, 1, "full", "error", Some(CANCELLED));
+
+        conn.execute("UPDATE builds SET files_done = files_total WHERE id = ?1", [all])
+            .expect("done");
+        assert_eq!(unfinished(&conn, 1).expect("all read"), None);
+
+        add(&conn, 1, "full", "ok", None);
+        assert_eq!(unfinished(&conn, 1).expect("finished"), None);
+    }
+
+    #[test]
+    fn a_session_that_finished_the_work_ends_the_row_of_an_owner_that_gave_up_as_ok() {
+        let conn = memory();
+        let cancelled = add(&conn, 1, "bulk", "error", Some(CANCELLED));
+        let broken = add(&conn, 1, "bulk", "error", Some("a file the parser cannot read"));
+        let running = add(&conn, 1, "bulk", "running", None);
+        let row = |id: i64| -> (String, Option<String>, i64) {
+            conn.query_row(
+                "SELECT status, error, files_done FROM builds WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("row")
+        };
+
+        for id in [cancelled, broken, running] {
+            complete_shared(&conn, id).expect("complete");
+        }
+
+        assert_eq!(row(cancelled), ("ok".to_owned(), None, 10));
+        // another failure stays what it was, with every file counted, and a build still running is left alone
+        assert_eq!(
+            row(broken),
+            ("error".to_owned(), Some("a file the parser cannot read".to_owned()), 10)
+        );
+        assert_eq!(row(running), ("running".to_owned(), None, 3));
     }
 
     fn memory() -> Connection {
