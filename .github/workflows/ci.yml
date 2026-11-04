@@ -20,6 +20,9 @@ jobs:
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # macOS arm64 runners are short of capacity: a job that never gets a runner must not block the Release workflow,
+    # which only starts when this whole workflow succeeds. Remove once the macOS queue is healthy again.
+    continue-on-error: ${{ startsWith(matrix.os, 'macos') }}
     strategy:
       fail-fast: false
       matrix:
