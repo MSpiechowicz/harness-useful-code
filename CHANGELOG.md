@@ -1,3 +1,10 @@
+## [1.2.1](https://github.com/MSpiechowicz/harness-useful-code/compare/v1.2.0...v1.2.1) (2026-11-04)
+
+
+### Bug Fixes
+
+* **code:** refresh a changed index in seconds and keep a build's progress ([0b94b5e](https://github.com/MSpiechowicz/harness-useful-code/commit/0b94b5efd399bbabc2462c06f03f894674f20310))
+
 # [1.2.0](https://github.com/MSpiechowicz/harness-useful-code/compare/v1.1.0...v1.2.0) (2026-11-03)
 
 
