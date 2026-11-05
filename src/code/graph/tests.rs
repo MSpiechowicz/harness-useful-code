@@ -258,6 +258,121 @@ fn a_stylesheet_token_is_used_through_its_module_namespace_or_by_name() {
     assert!(mixin.contains("src/ui/dropdown.scss:3 .dropdown"), "{mixin}");
 }
 
+#[test]
+fn a_selector_is_found_by_its_exact_name_wherever_the_rule_is_written() {
+    let mut repo = Repo::new();
+
+    repo.write(
+        "web/a.scss",
+        ".card, .panel { top: 0; }\n.card .title { top: 0; }\n@media (min-width: 1px) { .wide { top: 0; } }\n.nav { &--on { top: 0; } }\n.user { @extend .panel; }\n@keyframes spin { to { top: 0; } }\n",
+    );
+
+    let card = repo.symbol(".card");
+
+    assert!(card.contains("class .card  web/a.scss:1"), "{card}");
+    assert!(
+        !card.contains(".card .title"),
+        "the exact name wins over its words: {card}"
+    );
+    assert!(
+        repo.symbol(".panel").contains("web/a.scss:5 .user"),
+        "@extend reaches a later selector of a list"
+    );
+
+    for (query, place) in [
+        (".wide", "class .wide  web/a.scss:3"),
+        (".nav--on", "class .nav--on  web/a.scss:4"),
+        ("spin", "const spin  web/a.scss:6"),
+        ("web/a.scss::.panel", "class .panel  web/a.scss:1"),
+        (".title", "class .card .title  web/a.scss:2"),
+    ] {
+        let answer = repo.symbol(query);
+
+        assert!(answer.contains(place), "{query}: {answer}");
+    }
+}
+
+#[test]
+fn a_selector_named_like_a_member_does_not_hide_the_member() {
+    let mut repo = Repo::new();
+
+    repo.write("src/client.ts", "export class Client { get() {} }\n");
+    repo.write(
+        "web/a.css",
+        "Client.get { top: 0; }\na.btn { top: 0; }\n.a::before { top: 0; }\n",
+    );
+
+    let member = repo.symbol("Client.get");
+
+    assert!(member.contains("src/client.ts"), "{member}");
+    assert!(!member.contains("web/a.css"), "{member}");
+    assert!(
+        repo.symbol(".get").contains("src/client.ts"),
+        "a leading dot still finds the member by its word"
+    );
+    assert!(repo.symbol("a.btn").contains("class a.btn  web/a.css:2"));
+    assert!(repo.symbol(".a::before").contains("class .a::before  web/a.css:3"));
+}
+
+#[test]
+fn a_loose_path_match_does_not_hide_a_selector() {
+    let mut repo = Repo::new();
+
+    repo.write("src/app.ts", "export function btn() {}\n");
+    repo.write("web/a.css", "a.btn { top: 0; }\n");
+
+    assert!(repo.symbol("a.btn").contains("class a.btn  web/a.css:1"));
+    assert!(repo.symbol("btn").contains("src/app.ts"));
+}
+
+#[test]
+fn a_file_a_tool_wrote_is_left_out_and_a_query_for_it_is_told_so() {
+    let mut repo = Repo::new();
+    let minified = ".only-in-bundle{top:0}".repeat(500);
+
+    repo.write("package.json", "{}\n");
+    repo.write("assets/app.css", &minified);
+    repo.write("src/app.css", ".only-in-source { top: 0; }\n");
+    repo.write("dist/out.css", ".only-in-dist { top: 0; }\n");
+    repo.write("storybook-static/s.css", ".only-in-storybook { top: 0; }\n");
+
+    for query in [".only-in-bundle", ".only-in-dist", ".only-in-storybook"] {
+        assert!(
+            !repo.symbol(query).contains(&format!("class {query}")),
+            "{query} is left out"
+        );
+    }
+
+    for query in ["assets/app.css", "./assets/app.css"] {
+        let told = repo.symbol(query);
+
+        assert!(
+            told.contains("`assets/app.css` is in the repository but not in the index"),
+            "{told}"
+        );
+    }
+
+    let impact = repo.graph().impact("assets/app.css", 2);
+
+    assert!(impact.contains("not in the index"), "{impact}");
+
+    repo.write("coverage/lib.py", "def measure():\n    pass\n");
+    repo.write("out/writer.py", "def write():\n    pass\n");
+
+    assert!(
+        repo.symbol("measure").contains("coverage/lib.py"),
+        "`coverage` can be a package"
+    );
+    assert!(repo.symbol("write").contains("out/writer.py"), "`out` can be a module");
+
+    let source = repo.symbol("src/app.css");
+
+    assert!(
+        source.contains(".only-in-source") && !source.contains("not in the index"),
+        "{source}"
+    );
+}
+
 // ---- imports no config explains ------------------------------------------------------------------------
 
 #[test]

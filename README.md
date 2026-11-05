@@ -81,7 +81,8 @@ agents to use the tools before grep.
 ## How the index works
 
 It is built from the project's files with tree-sitter (Rust, TypeScript and JavaScript, `.svelte`, `.vue`
-and `.astro` files, Go, Python, SCSS and CSS). It is on by default.
+and `.astro` files, Go, Python, SCSS and CSS: every selector, nested ones named as they apply, wherever the
+rule is written). It is on by default.
 
 - **Always fresh.** Each `code_*` call compares the size and modification time of the files with the
   index, reads only the ones that changed and answers from the updated graph. There is no watcher, no

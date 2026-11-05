@@ -48,7 +48,11 @@ use super::walk::{Entry, TOO_LARGE};
 /// 18: the index `refs_from_symbol`: dropping a file cascades from its symbols to the references made from them,
 /// and without it each deleted symbol scanned every reference of every repository (minutes for a few hundred
 /// changed files). An index of 17 lacks it, so it is built again.
-pub const SCHEMA_VERSION: i64 = 18;
+/// 19: every selector of a stylesheet is a definition (each of a list, nested and in `@media` or `@layer`), and so
+/// is `@keyframes`; an index of 18 holds only the first selector of a top-level rule, so it is built again.
+/// A stylesheet that embeds a font or an image is no minified code any more, and `storybook-static` is an
+/// output folder.
+pub const SCHEMA_VERSION: i64 = 19;
 
 /// The refusal of a file written by a newer harness-code.
 pub const NEWER: &str = "the code index was written by a newer harness-code";

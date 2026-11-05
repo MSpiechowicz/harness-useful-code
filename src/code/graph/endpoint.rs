@@ -230,6 +230,27 @@ impl Graph {
         scope.is_none_or(|prefix| self.files.get(file).is_some_and(|f| f.path.starts_with(prefix)))
     }
 
+    /// What to say of a query that names a file the index holds no text of, rather than guess from its words.
+    pub(super) fn left_out_note(&self, query: &str) -> Option<String> {
+        let readings = self.readings(query);
+        let written = readings.last()?.trim_start_matches('/');
+
+        if written.is_empty() || extract::spec_for(written).is_none() || !self.files_named(query, None).is_empty() {
+            return None;
+        }
+
+        let path = self.left_out.iter().find(|path| {
+            readings.iter().any(|reading| reading == *path)
+                || path.strip_suffix(written).is_some_and(|before| before.ends_with('/'))
+        })?;
+
+        Some(format!(
+            "`{}` is in the repository but not in the index: a tool wrote it (generated or minified code), or it is too \
+             large or unreadable. Read the file itself; what it was built from is indexed under its own path.",
+            shown(path)
+        ))
+    }
+
     /// The files a text may mean: the one with that path, else the (few) files whose path ends with it.
     fn files_named(&self, query: &str, scope: Option<&str>) -> Vec<usize> {
         let readings = self.readings(query);

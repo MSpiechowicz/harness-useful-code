@@ -120,9 +120,9 @@ const HIDDEN_TOOL_DIRS: &[&str] = &[
 
 /// Folders that are build output at the top of the repository and next to a project manifest, but may be
 /// plain source folders elsewhere (`src/node/build/`). `.gitignore` covers the rest.
-const OUTPUT_DIRS: &[&str] = &["dist", "build"];
+const OUTPUT_DIRS: &[&str] = &["dist", "build", "storybook-static"];
 
-/// Files that make a folder a project root, whose `dist` and `build` folders are output.
+/// Files that make a folder a project root, whose [`OUTPUT_DIRS`] are output.
 const PROJECT_MANIFESTS: &[&str] = &[
     "package.json",
     "Cargo.toml",

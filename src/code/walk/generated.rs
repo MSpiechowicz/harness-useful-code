@@ -11,7 +11,8 @@
 //! - the runtime helpers esbuild puts at the top of a bundle (`var __defProp = Object.defineProperty;`), two of them
 //!   at least: one alone can be written by hand;
 //! - minified code: nearly all of its bytes on lines too long for a person to have written them. Hand-written code
-//!   can have a few long lines (a row mapper on one line), so a share of them is not enough.
+//!   can have a few long lines (a row mapper on one line), so a share of them is not enough, and what a file embeds
+//!   as a `data:` URI (a font in a stylesheet) is no line of code at all.
 
 /// The lines at the top that are read for a marker.
 const HEAD_LINES: usize = 40;
@@ -112,20 +113,116 @@ fn bundled(head: &str) -> bool {
         == 2
 }
 
-/// Most of the bytes of `text` on lines of [`MINIFIED_LINE`] bytes or more.
+/// Most of the bytes of `text` on lines of [`MINIFIED_LINE`] bytes or more, not counting what it embeds: a stylesheet
+/// a person wrote can hold a font or an image as one long `url(data:...)`.
 fn minified(text: &str) -> bool {
     if text.len() < MINIFIED_BYTES {
         return false;
     }
 
-    let long: usize = text.lines().map(str::len).filter(|len| *len >= MINIFIED_LINE).sum();
+    let (mut code, mut long) = (0usize, 0usize);
 
-    long.saturating_mul(100) >= text.len().saturating_mul(MINIFIED_SHARE)
+    for line in text.lines() {
+        let written = line.len().saturating_sub(embedded(line));
+
+        code += written;
+
+        if written >= MINIFIED_LINE {
+            long += written;
+        }
+    }
+
+    code >= MINIFIED_BYTES && long.saturating_mul(100) >= code.saturating_mul(MINIFIED_SHARE)
+}
+
+/// The bytes of `line` in `data:` URIs: the ones `url(`, a quote or `=` opens, each read once. A key of minified code
+/// (`{data:[1,2]}`) is no URI.
+fn embedded(line: &str) -> usize {
+    let mut bytes = 0;
+    let mut from = 0;
+
+    while let Some(at) = line
+        .get(from..)
+        .and_then(|rest| rest.find("data:"))
+        .map(|found| from + found)
+    {
+        let opener = line.get(..at).and_then(|before| before.bytes().last());
+        // a quoted URI holds the other quote and spaces (an inline SVG), `url(` runs to its parenthesis
+        let closers: Option<&[char]> = match opener {
+            Some(b'"') => Some(&['"']),
+            Some(b'\'') => Some(&['\'']),
+            Some(b'(') => Some(&[')']),
+            Some(b'=') => Some(&['"', '\'', ' ', '>']),
+            _ => None,
+        };
+
+        if let Some(closers) = closers {
+            let uri = line.get(at..).unwrap_or_default();
+            let len = uri.find(closers).unwrap_or(uri.len());
+
+            bytes += len;
+            from = at + len;
+        } else {
+            from = at + "data:".len();
+        }
+    }
+
+    bytes
 }
 
 #[cfg(test)]
 mod tests {
     use super::generated;
+
+    #[test]
+    fn an_inline_svg_ends_at_its_own_quote() {
+        let path = "M0 0 L1 1 ".repeat(1_000);
+        let svg = format!("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg'><path d='{path}'/></svg>");
+        let rules = ".card {\n  top: 0;\n}\n".repeat(300);
+
+        assert!(!generated(&format!(".a{{background:url(\"{svg}\")}}\n{rules}")));
+        assert!(!generated(&format!(
+            ".a{{background:url('{}')}}\n{rules}",
+            svg.replace('\'', "\"")
+        )));
+        assert!(!generated(&format!(".a{{background:url({svg})}}\n{rules}")));
+    }
+
+    #[test]
+    fn a_uri_is_counted_once_and_a_key_is_no_uri() {
+        let nested = format!(
+            "a{{b:url(data:image/svg+xml;utf8,{})}}\n.card {{ top: 0; }}\n",
+            "data:".repeat(200_000)
+        );
+
+        assert_eq!(
+            super::embedded(&nested.replace('\n', " ")),
+            nested.find(')').unwrap_or(0) - "a{b:url(".len()
+        );
+        assert!(
+            !generated(&nested),
+            "the whole URI is embedded, and reading it stays linear"
+        );
+        assert!(
+            generated(&format!("var x={{data:[{}]}};\n", "1,".repeat(100_000))),
+            "minified code with a key"
+        );
+    }
+
+    #[test]
+    fn a_stylesheet_that_embeds_a_font_is_no_minified_code() {
+        let font = "A".repeat(200_000);
+        let written =
+            format!("@font-face {{ src: url(data:font/woff2;base64,{font}) format('woff2'); }}\n.card {{ top: 0; }}\n");
+
+        assert!(!generated(&written));
+
+        let rules = ".card{top:0}".repeat(1_000);
+
+        assert!(generated(&format!(
+            "{rules}@font-face{{src:url(data:font/woff2;base64,{font})}}{rules}"
+        )));
+    }
 
     #[test]
     fn a_bundle_says_so_at_its_top() {

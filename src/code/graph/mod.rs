@@ -202,6 +202,8 @@ pub struct Graph {
     by_name: HashMap<String, Vec<usize>>,
     file_syms: Vec<Vec<usize>>,
     path_idx: HashMap<String, usize>,
+    /// The paths of the files that were not read: a query for one is told so.
+    left_out: Vec<String>,
     imports: HashMap<(usize, String), Imp>,
     /// Per file: what it passes on with `export ... from`.
     reexports: HashMap<usize, ts::Reexports>,
@@ -744,7 +746,16 @@ impl Graph {
             go_dirs.entry(file.pkg.clone()).or_default().push(i);
         }
 
+        let left_out = conn
+            .prepare("SELECT path FROM files WHERE repo_id = ?1 AND hash = '' ORDER BY path")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([repo], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(db)?;
         let mut graph = Graph {
+            left_out,
             root,
             files,
             syms,
@@ -942,6 +953,7 @@ impl Graph {
         }
 
         text += self.bases.estimated_bytes();
+        text += self.left_out.iter().map(String::len).sum::<usize>();
 
         self.refs
             .len()
@@ -1320,10 +1332,31 @@ impl Graph {
             Some((qual, name)) => (Some(qual), name),
             None => (None, query),
         };
+        let exact = || self.by_name.get(query).cloned().unwrap_or_default();
         let mut hits: Vec<usize> = self.by_name.get(name).cloned().unwrap_or_default();
+
+        // nothing stands before the separator: `.card` is a selector when one has that name, else `.get` is `get`
+        let qual = qual.filter(|qual| !qual.is_empty());
+
+        if split.is_some_and(|(qual, _)| qual.is_empty()) && self.by_name.contains_key(query) {
+            hits = exact();
+        }
 
         if let Some(qual) = qual {
             hits.retain(|s| self.in_qualifier(*s, qual));
+
+            // a member of that type wins (`Client.get`), but a name that holds the separator (`a.btn`, `.a::before`)
+            // says more than a file whose path happens to hold the qualifier
+            if !hits
+                .iter()
+                .any(|s| self.syms.get(*s).is_some_and(|sym| sym.parent.as_deref() == Some(qual)))
+            {
+                let whole = exact();
+
+                if !whole.is_empty() {
+                    hits = whole;
+                }
+            }
 
             // the best reading that finds anything wins
             let reading = |s: &usize| {

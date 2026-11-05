@@ -402,6 +402,11 @@ impl Graph {
     pub fn symbol(&self, query: &str, limit: usize) -> String {
         let cap = limit.clamp(1, 50);
         let query = query.trim();
+
+        if let Some(note) = self.left_out_note(query) {
+            return note;
+        }
+
         let end = self.endpoint(query, usize::MAX);
         let reading = end.reading;
         let mut defs = end.syms;
@@ -627,6 +632,11 @@ impl Graph {
     pub fn impact(&self, query: &str, depth: usize) -> String {
         let depth = depth.clamp(1, 4);
         let query = query.trim();
+
+        if let Some(note) = self.left_out_note(query) {
+            return note;
+        }
+
         let end = self.endpoint(query, usize::MAX);
         let (reading, note) = (end.reading, end.note);
         let start = end.syms;
