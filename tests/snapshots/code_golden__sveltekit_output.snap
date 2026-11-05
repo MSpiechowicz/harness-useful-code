@@ -21,7 +21,7 @@ component Card  src/lib/components/Card.svelte:1-8
   uses:
     applyTheme src/lib/theme.ts:1  at src/lib/components/Card.svelte:5 | const theme = applyTheme("…");
   used by 1 site(s):
-    src/routes/+page.svelte:8 +page | <Card title={today} />
+    src/routes/+page.svelte:8 +page
 
 == symbol applyTheme
 fn applyTheme  src/lib/theme.ts:1-3

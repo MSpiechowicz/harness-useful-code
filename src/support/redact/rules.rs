@@ -133,6 +133,22 @@ pub(super) fn has_token(text: &str) -> bool {
     })
 }
 
+/// [`has_token`] for a name: a `sk-` key counts only when its tail looks random (a digit, an upper and a lower
+/// case letter), since `.sk-circle-loader-wrapper-outer` is a class of a spinner library, not a key.
+pub(super) fn has_token_in_name(text: &str) -> bool {
+    TOKEN.find_iter(text).any(|found| {
+        let found = found.as_str();
+
+        if let Some(tail) = found.strip_prefix("sk-") {
+            return tail.bytes().any(|byte| byte.is_ascii_digit())
+                && tail.bytes().any(|byte| byte.is_ascii_uppercase())
+                && tail.bytes().any(|byte| byte.is_ascii_lowercase());
+        }
+
+        !found.starts_with("-----BEGIN ") || found.contains("PRIVATE KEY")
+    })
+}
+
 /// True when a URL in `text` carries a literal password (`scheme://user:password@`) or a literal
 /// value in a secret-looking query parameter. Values that reference a variable (`$TOKEN`) and a
 /// user without a password (`ssh://git@host`) do not count.

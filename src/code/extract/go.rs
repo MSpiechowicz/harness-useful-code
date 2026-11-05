@@ -285,6 +285,7 @@ impl Reader<'_> {
                 sig: first_line(spec, src),
                 ret: None,
                 test: false,
+                style: false,
             });
         }
     }
@@ -391,6 +392,8 @@ impl Reader<'_> {
             recv: None,
             line: node.start_position().row + 1,
             handler: super::handled(node, self.src),
+            style: false,
+            markup: false,
         });
     }
 }

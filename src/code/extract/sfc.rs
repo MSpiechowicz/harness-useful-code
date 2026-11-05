@@ -5,21 +5,36 @@
 //! (`<FooBar>`, `<Foo.Bar>`, `<foo-bar>`) and for quoted code names (`invoke('git_file_lines')`). The names the
 //! script imports are also looked for in the template's expressions (see `sfc_template`).
 //!
+//! The class attributes of the template (`class`, `:class`, `class:foo`, `class:list`) are `cls` references of the
+//! component (see `markup`); the stylesheet modules the script imports are honoured there (`styles.card`).
+//!
 //! The script, style and frontmatter regions are blanked in the template copy byte for byte (one ASCII space
 //! per byte, newlines kept), so offsets and line numbers of the template never shift, whatever the text holds.
+//!
+//! A `<style>` block is a stylesheet: its `lang` (or `type`) picks the reader (`css`, `postcss` and `scss` as
+//! they are, `sass` and `less` through their converters; `stylus` and anything unknown is left unread), and what
+//! it defines and uses is marked as written in a style block, so the graph reads it by the rules of
+//! stylesheets and not by those of the script around it. A block owns no definition: its rules stand on their
+//! own.
 
 use std::ops::Range;
 use std::path::Path;
 
 use tree_sitter::Parser;
 
-use super::{Extract, Sym, ident_like, out_of_time, push_ref};
+use super::classes::sheet_locals;
+use super::markup::Dialect;
+use super::{DROPPED, Extract, Import, Sym, ident_like, out_of_time, push_ref};
 
 /// The template scan looks at the clock this often, in bytes.
 pub(super) const SCAN_CHECK: usize = 1 << 16;
 
 /// A quoted string longer than this is not a code name.
 const MAX_QUOTED: usize = 80;
+
+/// The style blocks of one file that are read. A generated file with thousands of them would parse each in
+/// turn; the rest are left out and counted in [`Extract::dropped`].
+const MAX_STYLE_BLOCKS: usize = 16;
 
 /// Reads a single-file component.
 pub(super) fn extract(parser: &mut Parser, path: &str, src: &str, out: &mut Extract) {
@@ -38,6 +53,7 @@ pub(super) fn extract(parser: &mut Parser, path: &str, src: &str, out: &mut Extr
         sig: format!("<{stem}>"),
         ret: None,
         test: false,
+        style: false,
     });
 
     let owner = Some(component);
@@ -53,9 +69,11 @@ pub(super) fn extract(parser: &mut Parser, path: &str, src: &str, out: &mut Extr
     let mut counted = (0_usize, 0_usize);
 
     for block in blocks(src, "script") {
-        // every block is a parse of its own: the file's time is checked between them
+        // every block is a parse of its own: the file's time is checked between them. A script that is not read
+        // may hold class uses (`styles.card`, `clsx('a')`), so the count of its stylesheets may be low.
         if out_of_time() {
             out.dropped += 1;
+            out.classes_cut = true;
 
             break;
         }
@@ -69,20 +87,245 @@ pub(super) fn extract(parser: &mut Parser, path: &str, src: &str, out: &mut Extr
 
         counted = (block.body.start, line_off);
 
+        let first = out.refs.len();
+
         super::ts::extract_block(parser, &language, code, line_off, owner, false, out);
+
+        // the rows of the opening and the closing tag hold what is written around the script (`<p>text</p><script>f()`),
+        // so the line of a reference there is no line of code
+        let opening = line_off + 1;
+        let closing = line_off + count_newlines(code.as_bytes()) + 1;
+
+        for reference in out.refs.iter_mut().skip(first) {
+            if reference.line == opening || reference.line == closing {
+                reference.markup = true;
+            }
+        }
+
         blank(&mut markup, block.whole);
     }
 
-    for block in blocks(src, "style") {
-        blank(&mut markup, block.whole);
+    let styles = blocks(src, "style");
+
+    for block in &styles {
+        blank(&mut markup, block.whole.clone());
     }
 
+    // everything the three readers of the template find is written in markup, where the line of source holds
+    // the text of the page around it: the references are marked, the script blocks above and the styles below
+    // are not
+    out.in_markup = true;
     scan_template(&markup, owner, out);
 
-    let vue = Path::new(path).extension().is_some_and(|ext| ext == "vue");
+    let dialect = Dialect::of(path);
 
-    super::sfc_template::extract(&markup, vue, owner, out);
+    super::sfc_template::extract(&markup, dialect == Dialect::Vue, owner, out);
+
+    // a Vue template reaches the module of its `<style module>` as `$style`
+    let mut sheets = sheet_locals(&out.imports);
+
+    if dialect == Dialect::Vue {
+        sheets.insert("$style".to_string());
+    }
+
+    super::markup::extract(parser, &markup, dialect, &sheets, owner, out);
+    out.in_markup = false;
     super::ts::keep_function_values(out);
+
+    // the styles come last: nothing the script's passes do above sees a style definition or reference
+    read_styles(parser, src, &styles, out);
+}
+
+/// The language of a style block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StyleLang {
+    Scss,
+    Sass,
+    Less,
+}
+
+/// The reader of a `<style ...>` opening tag: `lang="scss"` or `type="text/less"`. A block with no attribute
+/// is CSS; Stylus and anything else is not read.
+fn style_lang(opening: &str) -> Option<StyleLang> {
+    let bytes = opening.as_bytes();
+    let mut lang: Option<&str> = None;
+    let mut kind: Option<&str> = None;
+    let mut at = "<style".len();
+
+    while let Some(&byte) = bytes.get(at) {
+        if byte.is_ascii_whitespace() || byte == b'/' || byte == b'>' {
+            at += 1;
+
+            continue;
+        }
+
+        let name_start = at;
+
+        while bytes
+            .get(at)
+            .is_some_and(|b| !b.is_ascii_whitespace() && !matches!(b, b'=' | b'>' | b'/'))
+        {
+            at += 1;
+        }
+
+        let name = opening.get(name_start..at).unwrap_or("");
+
+        if bytes.get(at) != Some(&b'=') {
+            continue;
+        }
+
+        at += 1;
+
+        let (value, next) = match bytes.get(at) {
+            Some(&quote) if quote == b'"' || quote == b'\'' => {
+                let close = bytes
+                    .get(at + 1..)
+                    .and_then(|rest| rest.iter().position(|b| *b == quote))
+                    .map_or(bytes.len(), |end| at + 1 + end);
+
+                (opening.get(at + 1..close).unwrap_or(""), close + 1)
+            }
+            _ => {
+                let end = bytes
+                    .get(at..)
+                    .and_then(|rest| rest.iter().position(|b| b.is_ascii_whitespace() || *b == b'>'))
+                    .map_or(bytes.len(), |end| at + end);
+
+                (opening.get(at..end).unwrap_or(""), end)
+            }
+        };
+
+        if name.eq_ignore_ascii_case("lang") {
+            lang = Some(value);
+        } else if name.eq_ignore_ascii_case("type") {
+            kind = Some(value);
+        }
+
+        at = next;
+    }
+
+    // `lang` wins over `type`, whichever comes first
+    let value = lang.or(kind).unwrap_or("css").trim().to_ascii_lowercase();
+
+    match value.rsplit('/').next().unwrap_or("") {
+        "" | "css" | "postcss" | "pcss" | "scss" => Some(StyleLang::Scss),
+        "sass" => Some(StyleLang::Sass),
+        "less" => Some(StyleLang::Less),
+        _ => None,
+    }
+}
+
+/// Reads the style `blocks` of `src` as stylesheets into `out`. Each is read apart from the file and then
+/// appended, so what the script produced keeps its indexes and a converter's name restoration (Less variables
+/// get their `@` back) cannot reach a script's definitions.
+///
+/// A style block that is not read (past [`MAX_STYLE_BLOCKS`], out of time, not parsed) loses selectors, never class
+/// uses: a block holds no `cls` reference, so [`Extract::classes_cut`] is not set for it. The selector is simply
+/// absent, and no count of users is shown for it.
+pub(super) fn read_styles(parser: &mut Parser, src: &str, blocks: &[Block], out: &mut Extract) {
+    let mut read = 0;
+    let mut counted = (0_usize, 0_usize);
+
+    for block in blocks {
+        let body = src.get(block.body.clone()).unwrap_or("");
+
+        // an empty block has nothing to read and takes no share of the cap
+        if body.trim().is_empty() {
+            continue;
+        }
+
+        let opening = src.get(block.whole.start..block.body.start).unwrap_or("");
+        let Some(lang) = style_lang(opening) else {
+            continue;
+        };
+
+        if read >= MAX_STYLE_BLOCKS {
+            out.dropped += 1;
+            out.selectors_cut = true;
+
+            continue;
+        }
+
+        // every block is a parse of its own: the file's time is checked between them
+        if out_of_time() {
+            out.dropped += 1;
+            out.selectors_cut = true;
+
+            break;
+        }
+
+        read += 1;
+
+        // the lines before the block are counted once for the file, not from the top for every block
+        let between = src
+            .as_bytes()
+            .get(counted.0..block.body.start)
+            .map_or(0, count_newlines);
+        let line_off = counted.1 + between;
+
+        counted = (block.body.start, line_off);
+
+        // the copy is a run of newlines and the body, so the lines of what it defines are those of the file
+        let mut copy = "\n".repeat(line_off);
+
+        copy.push_str(body);
+
+        // the names a file may work out are the file's, not each block's: sixteen blocks are no sixteen budgets
+        let mut apart = Extract {
+            names_worked: out.names_worked,
+            ..Extract::default()
+        };
+
+        match lang {
+            StyleLang::Scss => super::scss::extract(parser, "", &copy, &mut apart),
+            StyleLang::Sass => super::sass::extract(parser, "", &copy, &mut apart),
+            StyleLang::Less => super::less::extract(parser, "", &copy, &mut apart),
+        }
+
+        out.names_worked = apart.names_worked;
+        append_style(apart, out);
+    }
+}
+
+/// Appends what a style block gave to `out`, marked as written in a style. The definitions keep their order,
+/// so a reference's owner is found by the index its definition got in `out`; a definition that was not kept
+/// takes its references with it.
+fn append_style(apart: Extract, out: &mut Extract) {
+    let mut placed = Vec::with_capacity(apart.syms.len());
+
+    for mut sym in apart.syms {
+        sym.style = true;
+
+        let class = sym.kind == "class";
+        let kept = out.add_sym(sym);
+
+        // a selector the file has no room for is lost like one a block did not give
+        if kept == DROPPED && class {
+            out.selectors_cut = true;
+        }
+
+        placed.push(kept);
+    }
+
+    for mut reference in apart.refs {
+        reference.style = true;
+        reference.from = reference.from.map(|from| placed.get(from).copied().unwrap_or(DROPPED));
+        out.add_ref(reference);
+    }
+
+    for import in apart.imports {
+        // a namespace of a block is not one of the script; a sheet it loads is a sheet of the file
+        let local = if import.local.starts_with("sheet:") {
+            import.local
+        } else {
+            format!("style:{}", import.local)
+        };
+
+        out.add_import(Import { local, ..import });
+    }
+
+    out.dropped += apart.dropped;
+    out.selectors_cut |= apart.selectors_cut;
 }
 
 fn count_newlines(bytes: &[u8]) -> usize {
@@ -91,7 +334,7 @@ fn count_newlines(bytes: &[u8]) -> usize {
 
 /// Replaces every byte of `range` but newlines by an ASCII space: a multi-byte character becomes as many
 /// spaces as it has bytes.
-fn blank(markup: &mut [u8], range: Range<usize>) {
+pub(super) fn blank(markup: &mut [u8], range: Range<usize>) {
     if let Some(region) = markup.get_mut(range) {
         for byte in region {
             if *byte != b'\n' {
@@ -113,24 +356,38 @@ fn frontmatter(src: &str) -> Option<(&str, Range<usize>)> {
 }
 
 /// A `<tag ...> ... </tag>` block.
-struct Block {
+pub(super) struct Block {
     /// The text between the tags.
-    body: Range<usize>,
+    pub(super) body: Range<usize>,
     /// From `<tag` through the closing `>`.
-    whole: Range<usize>,
+    pub(super) whole: Range<usize>,
 }
 
-/// The `<tag>` blocks of `src`, in order. Quoted attribute values may hold a `>`; a self-closing tag has
-/// no block; a tag that never closes ends the search.
-fn blocks(src: &str, tag: &str) -> Vec<Block> {
+/// The first place at or after `from` where `needle` is written, whatever the case of its letters. HTML does
+/// not tell `<STYLE>` from `<style>`, and a page written in capitals is common; one pass over the bytes, and
+/// no more than `needle` long is compared at each.
+fn find_ignoring_case(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    let first = needle.first()?;
+
+    bytes
+        .get(from..)?
+        .windows(needle.len())
+        .position(|window| {
+            window.first().is_some_and(|b| b.eq_ignore_ascii_case(first)) && window.eq_ignore_ascii_case(needle)
+        })
+        .map(|found| from + found)
+}
+
+/// The `<tag>` blocks of `src`, in order; `tag` is written in lowercase and found in any case. Quoted
+/// attribute values may hold a `>`; a self-closing tag has no block; a tag that never closes ends the search.
+pub(super) fn blocks(src: &str, tag: &str) -> Vec<Block> {
     let bytes = src.as_bytes();
     let opening = format!("<{tag}");
     let closing = format!("</{tag}");
     let mut found = Vec::new();
     let mut at = 0;
 
-    while let Some(offset) = src.get(at..).and_then(|rest| rest.find(&opening)) {
-        let open = at + offset;
+    while let Some(open) = find_ignoring_case(bytes, at, opening.as_bytes()) {
         let after = open + opening.len();
 
         // `<scripts>` or `<style-guide>` are other tags
@@ -151,10 +408,9 @@ fn blocks(src: &str, tag: &str) -> Vec<Block> {
             continue;
         }
 
-        let Some(close_offset) = src.get(tag_end..).and_then(|rest| rest.find(&closing)) else {
+        let Some(close) = find_ignoring_case(bytes, tag_end, closing.as_bytes()) else {
             break;
         };
-        let close = tag_end + close_offset;
         let whole_end = src
             .get(close..)
             .and_then(|rest| rest.find('>'))
@@ -508,6 +764,155 @@ mod tests {
     }
 
     #[test]
+    fn a_style_block_defines_its_selectors_at_true_lines_between_two_scripts() {
+        let script = "<script>\nexport function first() {}\n</script>\n";
+        let after = "<script context=\"module\">\nexport function last() {}\n</script>\n";
+        let cases = [
+            ("A.vue", "css", ".card { color: red; }\n"),
+            ("B.svelte", "scss", "$gap: 4px;\n.card { margin: $gap; }\n"),
+            ("C.astro", "postcss", ".card { color: red; }\n"),
+            ("D.vue", "sass", "$gap: 4px\n.card\n  margin: $gap\n"),
+            ("E.svelte", "less", "@gap: 4px;\n.card { margin: @gap; }\n"),
+        ];
+
+        for (path, lang, body) in cases {
+            let src = format!("{script}\n<style lang=\"{lang}\">\n{body}</style>\n{after}");
+            let out = run(path, &src);
+            let card = out.syms.iter().find(|s| s.name == ".card");
+
+            // `<style>` is on line 5 and its body starts on line 6; `.card` follows the tokens
+            let expected = if body.starts_with('.') { 6 } else { 7 };
+
+            assert_eq!(card.map(|s| s.line), Some(expected), "{path} {lang}");
+            assert!(card.is_some_and(|s| s.style), "{path} {lang}");
+
+            // the scripts around it are read as before, and are no style
+            let line = |name: &str| out.syms.iter().find(|s| s.name == name).map(|s| (s.line, s.style));
+
+            assert_eq!(line("first"), Some((2, false)), "{path}");
+            assert_eq!(line("last"), Some((8 + body.lines().count(), false)), "{path}");
+        }
+    }
+
+    #[test]
+    fn style_references_name_their_own_definition_and_the_scripts_stay_unmarked() {
+        let out = run(
+            "A.vue",
+            "<script>\nimport { gap } from './x';\nexport function go() { return gap(1); }\n</script>\n<style lang=\"scss\">\n@use \"tokens\" as t;\n@import \"base\";\n.a { margin: t.$gap; @include box; }\n</style>\n",
+        );
+        let a = out.syms.iter().position(|s| s.name == ".a");
+
+        assert!(a.is_some());
+
+        let own: Vec<_> = out.refs.iter().filter(|r| r.style).collect();
+
+        assert!(
+            own.iter()
+                .any(|r| r.name == "$gap" && r.qual.as_deref() == Some("t") && r.from == a)
+        );
+        assert!(own.iter().any(|r| r.name == "box" && r.kind == "macro" && r.from == a));
+        assert!(out.refs.iter().any(|r| r.name == "gap" && !r.style));
+
+        let locals: Vec<&str> = out.imports.iter().map(|i| i.local.as_str()).collect();
+
+        assert_eq!(locals, vec!["gap", "style:t", "sheet:base"]);
+    }
+
+    #[test]
+    fn a_less_block_keeps_its_at_signs_and_leaves_the_script_names_alone() {
+        let out = run(
+            "A.vue",
+            "<script>\nexport function $price() {}\n</script>\n<style lang=\"less\">\n@gap: 4px;\n.a { margin: @gap; }\n</style>\n",
+        );
+
+        assert!(out.syms.iter().any(|s| s.name == "$price" && !s.style));
+        assert!(out.syms.iter().any(|s| s.name == "@gap" && s.style));
+        assert!(out.refs.iter().any(|r| r.name == "@gap" && r.style));
+    }
+
+    #[test]
+    fn stylus_and_unknown_blocks_are_skipped_and_empty_blocks_are_fine() {
+        for src in [
+            "<style lang=\"stylus\">\n.a\n  color red\n</style>\n",
+            "<style lang=\"wat\">.a { color: red }</style>\n",
+            "<style lang=\"sass\"></style>\n",
+            "<style></style>\n<style>   \n</style>\n",
+            "<style lang=\"scss\" src=\"./x.scss\" />\n",
+        ] {
+            let out = run("a.vue", src);
+
+            assert!(out.syms.iter().all(|s| !s.style), "{src}");
+        }
+    }
+
+    #[test]
+    fn the_language_is_read_from_lang_or_type_and_not_from_other_values() {
+        let lang = |tag: &str| style_lang(tag);
+
+        assert_eq!(lang("<style>"), Some(StyleLang::Scss));
+        assert_eq!(lang("<style scoped lang=\"scss\">"), Some(StyleLang::Scss));
+        assert_eq!(lang("<style lang=sass>"), Some(StyleLang::Sass));
+        assert_eq!(lang("<style type='text/less'>"), Some(StyleLang::Less));
+        assert_eq!(lang("<style data-x=\"lang=stylus\">"), Some(StyleLang::Scss));
+        assert_eq!(lang("<style lang=\"styl\">"), None);
+        assert_eq!(lang("<style lang=\"STYLUS\" scoped>"), None);
+    }
+
+    #[test]
+    fn a_string_in_a_style_variable_is_elided_like_a_stylesheet_string() {
+        let out = super::super::extract(
+            &mut Parser::new(),
+            "A.vue",
+            "<script>\nexport const a = 1;\n</script>\n<style lang=\"scss\">\n$k: \"abc\";\n</style>\n",
+        );
+        let k = out.syms.iter().find(|s| s.name == "$k");
+
+        assert!(k.is_some_and(|s| !s.sig.contains("abc")), "{:?}", k.map(|s| &s.sig));
+    }
+
+    #[test]
+    fn a_script_the_clock_cut_marks_the_file_and_a_style_block_that_is_cut_does_not() {
+        let src = "<script>\nexport const a = 1;\n</script>\n<style>.s { color: red }</style>\n";
+        let spent = std::time::Instant::now();
+        let out = super::super::extract_within(&mut Parser::new(), "a.vue", src, spent);
+
+        assert!(out.classes_cut, "a script that was not read may hold class uses");
+
+        // the styles are the last of the file: more of them than are read lose selectors, never a use
+        let many: String = (0..20)
+            .map(|i| format!("<style>.s{i} {{ color: red }}</style>\n"))
+            .collect();
+
+        assert!(!run("a.svelte", &many).classes_cut);
+    }
+
+    #[test]
+    fn only_the_first_style_blocks_are_read_and_the_rest_are_counted() {
+        let src: String = (0..20)
+            .map(|i| format!("<style>.s{i} {{ color: red }}</style>\n"))
+            .collect();
+        let out = run("a.svelte", &src);
+
+        assert_eq!(out.syms.iter().filter(|s| s.style).count(), MAX_STYLE_BLOCKS);
+        assert_eq!(out.dropped, 4);
+    }
+
+    #[test]
+    fn a_file_of_a_hundred_thousand_empty_style_blocks_is_read_quickly() {
+        let src = "<style></style>\n".repeat(100_000);
+        let started = std::time::Instant::now();
+        let out = run("a.vue", &src);
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(out.syms.iter().all(|s| !s.style));
+        assert_eq!(out.dropped, 0);
+    }
+
+    #[test]
     fn unterminated_blocks_do_not_panic() {
         for src in [
             "<script>",
@@ -516,9 +921,89 @@ mod tests {
             "---\n",
             "---\nx\n--",
             "<style>",
+            "<style lang=",
+            "<style lang=\"sass",
             "<script/>",
         ] {
             let _ = run("a.vue", src);
         }
+    }
+
+    #[test]
+    fn a_template_class_belongs_to_the_component_and_honours_the_sheets_the_script_imports() {
+        let svelte = run(
+            "ui/Box.svelte",
+            "<script>\n  import styles from './Box.module.css';\n  import './box.css';\n  const c = clsx('from-script');\n</script>\n\n<div class=\"plain {styles.card}\" class:on={x}>\n  <p class={cn('inner', styles['row'])}></p>\n</div>\n",
+        );
+        let found: Vec<(&str, Option<&str>, usize)> = svelte
+            .refs
+            .iter()
+            .filter(|r| r.kind == "cls")
+            .map(|r| (r.name.as_str(), r.qual.as_deref(), r.line))
+            .collect();
+
+        assert_eq!(
+            found,
+            vec![
+                ("from-script", None, 4),
+                ("plain", None, 7),
+                ("on", None, 7),
+                ("card", Some("styles"), 7),
+                ("inner", None, 8),
+                ("row", Some("styles"), 8),
+            ]
+        );
+        assert!(
+            svelte
+                .refs
+                .iter()
+                .filter(|r| r.kind == "cls")
+                .all(|r| r.from == Some(0) && !r.style)
+        );
+        assert!(svelte.imports.iter().any(|i| i.local == "sheet:./box.css"));
+    }
+
+    #[test]
+    fn a_vue_template_reaches_its_style_module_as_dollar_style() {
+        let out = run(
+            "ui/Card.vue",
+            "<template>\n  <p :class=\"[$style.card, { on: ok }]\">x</p>\n</template>\n<style module>\n.card { top: 0 }\n</style>\n",
+        );
+        let found: Vec<(&str, Option<&str>, usize)> = out
+            .refs
+            .iter()
+            .filter(|r| r.kind == "cls")
+            .map(|r| (r.name.as_str(), r.qual.as_deref(), r.line))
+            .collect();
+
+        assert_eq!(found, vec![("card", Some("$style"), 2), ("on", None, 2)]);
+    }
+
+    #[test]
+    fn a_file_of_many_empty_style_blocks_and_class_attributes_is_read_quickly() {
+        let started = std::time::Instant::now();
+        let src = "<style></style><p class=\"a\"></p>\n".repeat(100_000);
+        let out = run("ui/Many.svelte", &src);
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(out.refs.iter().filter(|r| r.kind == "cls").count(), 1);
+    }
+
+    #[test]
+    fn a_reference_on_the_row_of_a_script_tag_is_marked_and_one_on_a_row_of_code_is_not() {
+        let out = run(
+            "A.vue",
+            "<template><p>text</p></template><script>f()</script>\n<script>\ng();\nh();</script>\n<script>\nplain();\n</script>\n",
+        );
+        let marked = |name: &str| out.refs.iter().find(|r| r.name == name).map(|r| r.markup);
+
+        assert_eq!(marked("f"), Some(true));
+        assert_eq!(marked("g"), Some(false));
+        assert_eq!(marked("h"), Some(true));
+        assert_eq!(marked("plain"), Some(false));
     }
 }

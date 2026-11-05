@@ -321,6 +321,8 @@ impl Graph {
                 recv: None,
                 line: 0,
                 handler: false,
+                style: false,
+                markup: false,
             };
             let targets = self.resolve_ref(&pseudo).targets;
             let target = agreed(&targets.iter().map(|(sym, _)| *sym).collect::<Vec<_>>())?;
@@ -393,6 +395,8 @@ impl Graph {
             recv: None,
             line: 0,
             handler: false,
+            style: false,
+            markup: false,
         };
         let targets = self.resolve_ref(&pseudo).targets;
         let tys: Vec<Option<String>> = targets.iter().map(|(sym, _)| self.result_of(*sym)).collect();

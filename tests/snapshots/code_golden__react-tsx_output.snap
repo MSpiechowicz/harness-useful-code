@@ -29,7 +29,7 @@ method Api::listSubjects  src/api.ts:6-8
 fn Header  src/components/Header.tsx:1-3
   function Header({ title }: { title: string })
   used by 1 site(s):
-    src/App.tsx:7 App | <Header title="…" />
+    src/App.tsx:7 App
 
 == symbol MockApi.listSubjects
 method MockApi::listSubjects  src/mock.ts:5-7
@@ -44,7 +44,7 @@ fn SubjectList  src/components/SubjectList.tsx:3-13
   uses:
     useSubjects src/hooks.ts:4  at src/components/SubjectList.tsx:4 | const subjects = useSubjects();
   used by 1 site(s):
-    src/App.tsx:8 App | <SubjectList />
+    src/App.tsx:8 App
 
 == symbol useSubjects
 fn useSubjects  src/hooks.ts:4-12

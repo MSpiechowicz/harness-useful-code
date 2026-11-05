@@ -8,13 +8,19 @@
 //! The repository is untrusted input, so the `ignore` crate loads none of its ignore files: they are read
 //! here (`read_ignore`) with the same care as a source file. A link, a device or a file over 1 MB is never
 //! read, a `.git` file that points elsewhere is never followed, and nothing outside the root is opened.
-//! The ignore files of one walk are read up to a total of [`MAX_IGNORE_TOTAL`] bytes (the rest count as
-//! skipped), a line over [`MAX_IGNORE_LINE`] bytes is dropped, and only the rules of the folders on the path
-//! to the current folder are kept in memory. The walk gives up with "indexing took too long" at its deadline.
+//! `.gitattributes` and `.git/info/attributes` are read the same way, on a byte budget of their own, for
+//! `linguist-generated`: a source file they mark is an entry with `attr_generated` set, which [`read_text`]
+//! leaves unread. The ignore files of one walk are read up to a total of [`MAX_IGNORE_TOTAL`] bytes (the rest
+//! count as skipped), a line over [`MAX_IGNORE_LINE`] bytes is dropped, and only the rules of the folders on the path
+//! to the current folder are kept in memory. `.html` files count toward no cap during the walk: after it the
+//! first [`MAX_HTML_FILES`] by path that fit in the room the code leaves are kept (those in a folder of output,
+//! such as `docs/` or `coverage/`, after all the others) and the rest are counted as skipped, so a page never makes the walk end in "too large". The selectors in the `<style>` of a page are
+//! read later and count toward the row caps of the store (`Caps`) like any other definition. The walk gives up with "indexing took too long" at its deadline.
 //! [`read_text`] opens the file without following a link, checks the handle (a regular file with one link,
 //! at most 1 MB, inside the root, and on Unix the very file the walk saw, so a swap for a link is noticed)
 //! and reads at most one byte more than the cap.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -66,6 +72,29 @@ impl Default for Limits {
             path_total: 16 * 1024 * 1024,
         }
     }
+}
+
+/// The most `.html` files one walk keeps. A page is no code, and a repository can hold tens of thousands of them
+/// (a built site, a documentation tree): they are taken after the walk, in the room the code files leave, so
+/// they never make a repository too large and the ones kept do not depend on the order the system lists a
+/// folder in. The pages of the folders that hold output (see [`OUTPUT_FOLDERS`]) come after all the others, each
+/// group in path order, so a built `docs/` or `coverage/` does not take the room that `src/` pages need.
+pub const MAX_HTML_FILES: usize = 2_000;
+
+/// The folder names (at any depth) whose pages are most often generated: documentation, coverage and test
+/// reports, a built site, a component catalogue. `public/docs` is one of them by its `docs`.
+const OUTPUT_FOLDERS: [&str; 7] = ["docs", "doc", "coverage", "site", "storybook", "reports", "out"];
+
+/// True when the page at `rel` is in a folder named like one of [`OUTPUT_FOLDERS`].
+fn in_output_folder(rel: &str) -> bool {
+    let mut parts = rel.split('/').collect::<Vec<_>>();
+
+    // the last part is the page itself
+    parts.pop();
+
+    parts
+        .iter()
+        .any(|part| OUTPUT_FOLDERS.iter().any(|folder| part.eq_ignore_ascii_case(folder)))
 }
 
 /// The error of a walk past its caps.
@@ -154,6 +183,9 @@ pub struct Entry {
     /// Device and inode of what the walk saw (Unix).
     pub identity: Option<(u64, u64)>,
     pub class: Class,
+    /// `.gitattributes` marks the file `linguist-generated`. The walk sets it; a change of it counts as a
+    /// change of the file, because the attributes can move without the file being touched.
+    pub attr_generated: bool,
 }
 
 /// What was left out, and why.
@@ -183,6 +215,9 @@ impl Skipped {
 pub struct Walked {
     pub entries: Vec<Entry>,
     pub skipped: Skipped,
+    /// The `.html` pages left out by [`MAX_HTML_FILES`] or the room the code leaves. A page is a use of class
+    /// names, so the count tells a selector's `used by` that it may be low.
+    pub pages_cut: usize,
 }
 
 /// Walks `root` with the default caps and no deadline. `stop` is polled for every entry.
@@ -221,6 +256,7 @@ pub(super) fn walk_until(
         ignores: Ignores::new(root, deadline, limits.ignore_bytes),
         device: fs::symlink_metadata(root).ok().and_then(|metadata| device(&metadata)),
         walked: Walked::default(),
+        pages: Vec::new(),
         path_bytes: 0,
         // the root itself
         visited: 1,
@@ -228,6 +264,7 @@ pub(super) fn walk_until(
 
     walk.poll()?;
     walk.folder(root, 0)?;
+    walk.keep_pages();
 
     // the filter turns every entry away once the deadline passed, which ends the loop quietly
     if walk.ignores.expired() {
@@ -255,6 +292,9 @@ struct Walk<'a> {
     /// The device of the root: a folder on another one is not entered (Unix).
     device: Option<u64>,
     walked: Walked,
+    /// The `.html` files found: they count toward no cap while the walk goes on, and [`Walk::keep_pages`] takes
+    /// what fits after it.
+    pages: Vec<Entry>,
     /// The bytes of the paths of the files kept so far (see [`Limits::path_total`]).
     path_bytes: usize,
     /// Entries the walk counts against [`Limits::walked`]: the ones it did not turn away.
@@ -399,25 +439,77 @@ impl Walk<'_> {
             return Ok(());
         }
 
-        if self.walked.entries.len() >= self.limits.indexed {
+        let page = class == Class::Source("html");
+
+        if !page && self.walked.entries.len() >= self.limits.indexed {
             return Err(TOO_LARGE.into());
         }
 
-        self.path_bytes = self.path_bytes.saturating_add(rel.len());
+        if !page {
+            self.path_bytes = self.path_bytes.saturating_add(rel.len());
 
-        if self.path_bytes > self.limits.path_total {
-            return Err(TOO_LARGE.into());
+            if self.path_bytes > self.limits.path_total {
+                return Err(TOO_LARGE.into());
+            }
         }
 
-        self.walked.entries.push(Entry {
+        // a manifest is read as it is, whatever the attributes say of its path
+        let attr_generated =
+            matches!(class, Class::Source(_)) && full.parent().is_some_and(|dir| self.ignores.generated(dir, full));
+        let entry = Entry {
             rel,
             mtime_ns: mtime_ns(&metadata),
             size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
             identity: identity(&metadata),
             class,
-        });
+            attr_generated,
+        };
+
+        if page {
+            self.pages.push(entry);
+        } else {
+            self.walked.entries.push(entry);
+        }
 
         Ok(())
+    }
+
+    /// Adds the `.html` files found, the ones outside the output folders first and each group in path order, up
+    /// to [`MAX_HTML_FILES`] and the room the file and path caps leave after the code. The rest are counted as
+    /// skipped: a page never makes the walk end in "too large" (the selectors in its `<style>` still count toward
+    /// `Caps`).
+    fn keep_pages(&mut self) {
+        let mut pages = std::mem::take(&mut self.pages);
+
+        // the key is worked out once for each page: a comparison would walk the components of both paths again
+        // every time, and a page is compared about log(n) times
+        pages.sort_by_cached_key(|page| (in_output_folder(&page.rel), PathBuf::from(&page.rel)));
+
+        let room = self
+            .limits
+            .indexed
+            .saturating_sub(self.walked.entries.len())
+            .min(MAX_HTML_FILES);
+        let mut kept = 0;
+        let mut open = true;
+
+        for page in pages {
+            let path_bytes = self.path_bytes.saturating_add(page.rel.len());
+
+            // the pages kept are a prefix of the sorted ones: once one does not fit, none after it is taken
+            open = open && kept < room && path_bytes <= self.limits.path_total;
+
+            if !open {
+                self.walked.skipped.unsafe_or_large += 1;
+                self.walked.pages_cut += 1;
+
+                continue;
+            }
+
+            self.path_bytes = path_bytes;
+            kept += 1;
+            self.walked.entries.push(page);
+        }
     }
 }
 
@@ -453,9 +545,19 @@ const MAX_IGNORE_LINES: usize = 20_000;
 /// The most ignore patterns a walk compiles.
 const MAX_IGNORE_PATTERNS: usize = 100_000;
 
-/// The ignore files of a folder, in the order ripgrep ranks them: `.ignore`, `.gitignore`,
-/// `.git/info/exclude`.
-type Rules = [Option<Arc<Gitignore>>; 3];
+/// The most bytes of attribute files one walk reads. They have a budget of their own: a large `.gitattributes`
+/// must not use up [`MAX_IGNORE_TOTAL`], or the ignore files read after it would be refused and the folders
+/// they exclude would be indexed.
+const MAX_ATTRIBUTES_TOTAL: usize = 256 * 1024;
+
+/// The rule files of a folder: the three ignore files in the order ripgrep ranks them (`.ignore`,
+/// `.gitignore`, `.git/info/exclude`), then `.gitattributes` and `.git/info/attributes`, whose lines are
+/// reduced to the `linguist-generated` verdict (see [`attribute_pattern`]).
+type Rules = [Option<Arc<Gitignore>>; 5];
+
+/// The slots of [`Rules`] that hold attributes.
+const ATTRIBUTES: usize = 3;
+const INFO_ATTRIBUTES: usize = 4;
 
 /// An ignore file compiled by an earlier walk of this process, with what that walk counted for it.
 struct Compiled {
@@ -546,6 +648,29 @@ impl Chain {
 
         Verdict::Undecided
     }
+
+    /// True when `linguist-generated` is set for `path`, a file. `.git/info/attributes` outranks every
+    /// `.gitattributes`, and a deeper `.gitattributes` outranks the ones above it; the first file with a
+    /// matching line decides, and inside a file the last matching line does.
+    fn generated(&self, path: &Path) -> bool {
+        for kind in [INFO_ATTRIBUTES, ATTRIBUTES] {
+            let mut node = Some(self);
+
+            while let Some(chain) = node {
+                if let Some(matcher) = chain.own.get(kind).and_then(Option::as_ref) {
+                    match matcher.matched(path, false) {
+                        Match::Ignore(_) => return true,
+                        Match::Whitelist(_) => return false,
+                        Match::None => {}
+                    }
+                }
+
+                node = chain.parent.as_deref();
+            }
+        }
+
+        false
+    }
 }
 
 /// The ignore rules of a walk, read by this module and never by the `ignore` crate.
@@ -560,6 +685,9 @@ struct Ignores {
     patterns: AtomicUsize,
     /// Bytes of ignore files read so far.
     bytes: AtomicUsize,
+    /// Bytes and patterns of attribute files read so far, apart from the ignore files'.
+    attr_bytes: AtomicUsize,
+    attr_patterns: AtomicUsize,
     /// The most bytes of ignore files the walk reads.
     byte_cap: usize,
     deadline: Option<Instant>,
@@ -575,6 +703,8 @@ impl Ignores {
             refused: AtomicUsize::new(0),
             patterns: AtomicUsize::new(0),
             bytes: AtomicUsize::new(0),
+            attr_bytes: AtomicUsize::new(0),
+            attr_patterns: AtomicUsize::new(0),
             byte_cap,
             deadline,
             late: AtomicBool::new(false),
@@ -620,6 +750,11 @@ impl Ignores {
         }
     }
 
+    /// True when the attribute files above `file`, which lies in the folder `dir`, mark it generated.
+    fn generated(&self, dir: &Path, file: &Path) -> bool {
+        self.chain(dir).generated(file)
+    }
+
     /// The chain of the directory `dir`, built (reading its ignore files) on first use.
     fn chain(&self, dir: &Path) -> Arc<Chain> {
         if let Some(found) = self.chains.lock().unwrap_or_else(PoisonError::into_inner).get(dir) {
@@ -656,26 +791,56 @@ impl Ignores {
     fn read_dir_rules(&self, dir: &Path, room: bool) -> Rules {
         // only a real `.git` folder: a `.git` file (a worktree or a submodule) points elsewhere, and a link
         // could point anywhere
-        let exclude = fs::symlink_metadata(dir.join(".git")).is_ok_and(|meta| meta.is_dir());
+        let git = dir.join(".git");
+        let real_git = fs::symlink_metadata(&git).is_ok_and(|meta| meta.is_dir());
+
+        // `.git/info` too: a link there would lead to files of any folder, which a file of the repository could
+        // then use as its own ignore rules and attributes
+        let exclude = real_git && fs::symlink_metadata(git.join("info")).is_ok_and(|meta| meta.is_dir());
 
         [
-            self.read_ignore(dir, &dir.join(".ignore"), room),
-            self.read_ignore(dir, &dir.join(".gitignore"), room),
+            self.read_ignore(dir, &dir.join(".ignore"), room, Lines::Ignore),
+            self.read_ignore(dir, &dir.join(".gitignore"), room, Lines::Ignore),
             exclude
-                .then(|| self.read_ignore(dir, &dir.join(".git").join("info").join("exclude"), room))
+                .then(|| self.read_ignore(dir, &dir.join(".git").join("info").join("exclude"), room, Lines::Ignore))
+                .flatten(),
+            self.read_ignore(dir, &dir.join(".gitattributes"), room, Lines::Attributes),
+            exclude
+                .then(|| {
+                    self.read_ignore(
+                        dir,
+                        &dir.join(".git").join("info").join("attributes"),
+                        room,
+                        Lines::Attributes,
+                    )
+                })
                 .flatten(),
         ]
     }
 
-    /// The rules of one ignore file, when it is a small regular file inside the root and the chain of folders
-    /// above it has `room` for one more.
-    fn read_ignore(&self, dir: &Path, file: &Path, room: bool) -> Option<Arc<Gitignore>> {
+    /// The rules of one ignore or attribute file, when it is a small regular file inside the root and the chain
+    /// of folders above it has `room` for one more.
+    fn read_ignore(&self, dir: &Path, file: &Path, room: bool, lines: Lines) -> Option<Arc<Gitignore>> {
+        // attribute files are counted apart, so they cannot crowd the ignore files out of their budget
+        let meter = match lines {
+            Lines::Ignore => Meter {
+                bytes: &self.bytes,
+                patterns: &self.patterns,
+                cap: self.byte_cap,
+            },
+            Lines::Attributes => Meter {
+                bytes: &self.attr_bytes,
+                patterns: &self.attr_patterns,
+                cap: MAX_ATTRIBUTES_TOTAL,
+            },
+        };
+
         let Ok(seen) = fs::symlink_metadata(file) else {
             return None; // most directories have none
         };
 
         // the total of the walk is capped, so many folders with a large file each cost a bounded amount
-        if !room || self.expired() || self.bytes.load(Ordering::Relaxed) >= self.byte_cap {
+        if !room || self.expired() || meter.bytes.load(Ordering::Relaxed) >= meter.cap {
             self.refused.fetch_add(1, Ordering::Relaxed);
 
             return None;
@@ -691,7 +856,7 @@ impl Ignores {
                 .filter(|hit| (hit.mtime_ns, hit.size) == stamp)
                 .map(|hit| (hit.text_len, hit.added, hit.dropped, hit.rules.clone()))
         {
-            return self.account(hit.0, hit.1, hit.2).then_some(hit.3).flatten();
+            return self.account(&meter, hit.0, hit.1, hit.2).then_some(hit.3).flatten();
         }
 
         let Some(text) = read_ignore_text(&self.root, file) else {
@@ -700,7 +865,7 @@ impl Ignores {
             return None;
         };
 
-        if self.bytes.load(Ordering::Relaxed).saturating_add(text.len()) > self.byte_cap {
+        if meter.bytes.load(Ordering::Relaxed).saturating_add(text.len()) > meter.cap {
             self.refused.fetch_add(1, Ordering::Relaxed);
 
             return None;
@@ -717,17 +882,32 @@ impl Ignores {
                 line
             };
 
-            if line.len() > MAX_IGNORE_LINE || wildcards(line) > MAX_IGNORE_WILDCARDS {
+            if line.len() > MAX_IGNORE_LINE {
                 dropped = true;
 
                 continue;
             }
 
-            if self.patterns.load(Ordering::Relaxed) + added >= MAX_IGNORE_PATTERNS {
+            // an attribute line becomes the pattern it sets (or `!` and the pattern it cancels), or nothing
+            let line = match lines {
+                Lines::Ignore => Cow::Borrowed(line),
+                Lines::Attributes => match attribute_pattern(line) {
+                    Some(pattern) => Cow::Owned(pattern),
+                    None => continue,
+                },
+            };
+
+            if wildcards(&line) > MAX_IGNORE_WILDCARDS {
+                dropped = true;
+
+                continue;
+            }
+
+            if meter.patterns.load(Ordering::Relaxed) + added >= MAX_IGNORE_PATTERNS {
                 break;
             }
 
-            if builder.add_line(None, line).is_ok() {
+            if builder.add_line(None, &line).is_ok() {
                 added += 1;
             }
         }
@@ -738,18 +918,20 @@ impl Ignores {
             remember(file, stamp, text.len(), added, dropped, &rules);
         }
 
-        self.account(text.len(), added, dropped).then_some(rules).flatten()
+        self.account(&meter, text.len(), added, dropped)
+            .then_some(rules)
+            .flatten()
     }
 
     /// Counts a compiled file against the walk's totals; false when it takes the walk past the byte total.
-    fn account(&self, text_len: usize, added: usize, dropped: bool) -> bool {
-        if self.bytes.fetch_add(text_len, Ordering::Relaxed) + text_len > self.byte_cap {
+    fn account(&self, meter: &Meter, text_len: usize, added: usize, dropped: bool) -> bool {
+        if meter.bytes.fetch_add(text_len, Ordering::Relaxed) + text_len > meter.cap {
             self.refused.fetch_add(1, Ordering::Relaxed);
 
             return false;
         }
 
-        self.patterns.fetch_add(added, Ordering::Relaxed);
+        meter.patterns.fetch_add(added, Ordering::Relaxed);
 
         // a file with a line left out is partly read
         if dropped {
@@ -758,6 +940,88 @@ impl Ignores {
 
         true
     }
+}
+
+/// How the lines of a rule file are read.
+#[derive(Clone, Copy)]
+enum Lines {
+    /// Gitignore syntax, as it is.
+    Ignore,
+    /// Gitattributes syntax: only what `linguist-generated` says.
+    Attributes,
+}
+
+/// The counters a rule file is charged to: the ignore files share one set, the attribute files another.
+struct Meter<'a> {
+    bytes: &'a AtomicUsize,
+    patterns: &'a AtomicUsize,
+    cap: usize,
+}
+
+/// The gitignore line that stands for what an attributes line says of `linguist-generated`: the pattern when
+/// the attribute is set (bare or `=true`), `!` and the pattern when it is cancelled (`-`, `!` or `=false`, or
+/// any other value), and nothing for a line that does not mention it, a comment, an `[attr]` macro or a
+/// pattern starting with `!` (git refuses those). The last mention on a line wins. A pattern is quoted when it
+/// holds a space. The matcher then gives last-match-wins, and does not look at parent folders: a pattern that
+/// names a folder reaches the folder and not its files, and a trailing slash reaches no file, as in git.
+fn attribute_pattern(line: &str) -> Option<String> {
+    let line = line.trim_start();
+
+    if line.is_empty() || line.starts_with('#') || line.starts_with("[attr]") {
+        return None;
+    }
+
+    let (pattern, rest) = if let Some(quoted) = line.strip_prefix('"') {
+        let mut pattern = String::new();
+        let mut chars = quoted.char_indices();
+        let mut end = None;
+
+        while let Some((at, ch)) = chars.next() {
+            match ch {
+                '"' => {
+                    end = Some(at + 1);
+
+                    break;
+                }
+                '\\' => match chars.next() {
+                    Some((_, 'n')) => pattern.push('\n'),
+                    Some((_, 't')) => pattern.push('\t'),
+                    Some((_, other)) => pattern.push(other),
+                    None => return None,
+                },
+                other => pattern.push(other),
+            }
+        }
+
+        (pattern, quoted.get(end?..)?)
+    } else {
+        let split = line.find(char::is_whitespace).unwrap_or(line.len());
+
+        (line.get(..split)?.to_owned(), line.get(split..)?)
+    };
+
+    if pattern.is_empty() || pattern.starts_with('!') {
+        return None;
+    }
+
+    let mut set = None;
+
+    for token in rest.split_whitespace() {
+        match token {
+            "linguist-generated" | "linguist-generated=true" => set = Some(true),
+            "-linguist-generated" | "!linguist-generated" => set = Some(false),
+            other if other.starts_with("linguist-generated=") => set = Some(false),
+            _ => {}
+        }
+    }
+
+    // the line is a gitignore line from here on: a leading `#` of the pattern would start a comment
+    let pattern = match pattern.strip_prefix('#') {
+        Some(tail) => format!("\\#{tail}"),
+        None => pattern,
+    };
+
+    Some(if set? { pattern } else { format!("!{pattern}") })
 }
 
 /// How many wildcard characters `line` holds.
@@ -1013,6 +1277,11 @@ pub enum Read {
 
 /// Reads the file of `entry`, which the walk of `root` found, as UTF-8 (a leading byte order mark is dropped).
 pub fn read_text(root: &Path, entry: &Entry) -> Read {
+    // the attributes said so: the file is not even opened
+    if entry.attr_generated {
+        return Read::Skipped(Skip::Generated);
+    }
+
     let abs = root.join(&entry.rel);
     let Ok(file) = open_nofollow(&abs) else {
         return Read::Skipped(Skip::Unreadable);
@@ -1280,6 +1549,10 @@ mod tests {
             "jsconfig.json",
             "a.ts",
             "b.svelte",
+            "c.sass",
+            "d.less",
+            "e.SCSS",
+            "f.html",
         ] {
             fs::write(dir.path().join(name), "x").expect("write");
         }
@@ -1292,6 +1565,10 @@ mod tests {
         assert!(classes.contains(&("jsconfig.json", Class::Package)));
         assert!(classes.contains(&("a.ts", Class::Source("ts"))));
         assert!(classes.contains(&("b.svelte", Class::Source("ts"))));
+        assert!(classes.contains(&("c.sass", Class::Source("scss"))));
+        assert!(classes.contains(&("d.less", Class::Source("scss"))));
+        assert!(classes.contains(&("e.SCSS", Class::Source("scss"))));
+        assert!(classes.contains(&("f.html", Class::Source("html"))));
     }
 
     #[test]
@@ -1421,6 +1698,130 @@ mod tests {
         assert_eq!(walk_with(dir.path(), &never, enough).expect("walk").entries.len(), 5);
     }
 
+    #[test]
+    fn html_pages_keep_the_first_two_thousand_by_path_and_never_make_the_repository_too_large() {
+        let dir = root();
+
+        fs::create_dir_all(dir.path().join("site")).expect("dir");
+
+        for n in 0..2_500 {
+            fs::write(dir.path().join(format!("site/p{n:04}.html")), "<p>x</p>").expect("write");
+        }
+
+        fs::write(dir.path().join("a.rs"), "fn a() {}").expect("write");
+
+        // the page count past the file cap is no error: code first, pages in the room that is left
+        let tight = Limits {
+            indexed: 10,
+            ..Limits::default()
+        };
+        let walked = walk_with(dir.path(), &never, tight).expect("walk");
+        let pages: Vec<&str> = walked
+            .entries
+            .iter()
+            .filter(|e| e.rel.ends_with(".html"))
+            .map(|e| e.rel.as_str())
+            .collect();
+
+        assert_eq!(pages.len(), 9);
+        assert_eq!(pages.first(), Some(&"site/p0000.html"));
+        assert_eq!(pages.last(), Some(&"site/p0008.html"));
+        assert_eq!(walked.skipped.unsafe_or_large, 2_491);
+        assert_eq!(
+            walked.pages_cut, 2_491,
+            "every page left out is counted for the class notes"
+        );
+
+        let walked = walk(dir.path(), &never).expect("walk");
+        let pages: Vec<&str> = walked
+            .entries
+            .iter()
+            .filter(|e| e.rel.ends_with(".html"))
+            .map(|e| e.rel.as_str())
+            .collect();
+
+        assert_eq!(pages.len(), MAX_HTML_FILES);
+        assert_eq!(pages.last(), Some(&"site/p1999.html"));
+        assert_eq!(walked.skipped.unsafe_or_large, 500);
+        assert!(walked.entries.iter().any(|e| e.rel == "a.rs"));
+        assert!(walked.entries.is_sorted_by(|a, b| a.rel <= b.rel));
+
+        // the same files, the same pages kept
+        let again = walk(dir.path(), &never).expect("walk");
+
+        assert_eq!(rels(&again), rels(&walked));
+    }
+
+    #[test]
+    fn the_pages_of_output_folders_take_the_room_after_the_pages_of_the_rest() {
+        let dir = root();
+
+        for folder in ["docs", "coverage/lcov-report", "a/Storybook"] {
+            fs::create_dir_all(dir.path().join(folder)).expect("dir");
+        }
+
+        fs::create_dir_all(dir.path().join("src/views")).expect("dir");
+
+        for n in 0..1_000 {
+            fs::write(dir.path().join(format!("docs/d{n:04}.html")), "<p>x</p>").expect("write");
+            fs::write(
+                dir.path().join(format!("coverage/lcov-report/c{n:04}.html")),
+                "<p>x</p>",
+            )
+            .expect("write");
+        }
+
+        fs::write(dir.path().join("a/Storybook/s.html"), "<p>x</p>").expect("write");
+
+        for name in ["src/views/a.html", "src/views/b.html", "index.html"] {
+            fs::write(dir.path().join(name), "<p>x</p>").expect("write");
+        }
+
+        let walked = walk(dir.path(), &never).expect("walk");
+        let pages: Vec<&str> = walked
+            .entries
+            .iter()
+            .filter(|e| e.rel.ends_with(".html"))
+            .map(|e| e.rel.as_str())
+            .collect();
+
+        assert_eq!(pages.len(), MAX_HTML_FILES);
+        assert!(
+            ["index.html", "src/views/a.html", "src/views/b.html"]
+                .iter()
+                .all(|p| pages.contains(p))
+        );
+        // the output folders fill what is left, in path order: a/Storybook, then coverage, then docs
+        assert!(pages.contains(&"a/Storybook/s.html"));
+        assert!(pages.contains(&"coverage/lcov-report/c0000.html"));
+        assert!(!pages.contains(&"docs/d0999.html"));
+        assert_eq!(walked.skipped.unsafe_or_large, 4);
+
+        // the same files, the same pages kept
+        let again = walk(dir.path(), &never).expect("walk");
+
+        assert_eq!(rels(&again), rels(&walked));
+    }
+
+    #[test]
+    fn a_page_is_left_out_when_the_paths_of_the_files_have_no_room_for_it() {
+        let dir = root();
+
+        fs::write(dir.path().join("a.rs"), "fn a() {}").expect("write");
+        fs::write(dir.path().join("b.html"), "<p></p>").expect("write");
+        fs::write(dir.path().join("c.html"), "<p></p>").expect("write");
+
+        // "a.rs" and "b.html" fit, "c.html" does not
+        let few = Limits {
+            path_total: "a.rs".len() + "b.html".len(),
+            ..Limits::default()
+        };
+        let walked = walk_with(dir.path(), &never, few).expect("walk");
+
+        assert_eq!(rels(&walked), vec!["a.rs", "b.html"]);
+        assert_eq!(walked.skipped.unsafe_or_large, 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_link_count_of_zero_or_two_is_not_safe_and_one_is() {
@@ -1440,6 +1841,334 @@ mod tests {
         fs::remove_file(&path).expect("remove");
         fs::remove_file(dir.path().join("b.rs")).expect("remove");
         assert!(maybe_linked(&open.metadata().expect("metadata")));
+    }
+
+    /// The files the attributes mark, by path.
+    fn marked(walked: &Walked) -> Vec<&str> {
+        walked
+            .entries
+            .iter()
+            .filter(|entry| entry.attr_generated)
+            .map(|entry| entry.rel.as_str())
+            .collect()
+    }
+
+    fn put(dir: &Path, rel: &str, content: &str) {
+        let path = dir.join(rel);
+
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(path, content).expect("write");
+    }
+
+    #[test]
+    fn a_file_matched_by_linguist_generated_is_marked_and_left_unread() {
+        let dir = root();
+
+        put(
+            dir.path(),
+            ".gitattributes",
+            "gen/** linguist-generated\n*.min.js linguist-generated=true\n",
+        );
+        put(dir.path(), "gen/a.ts", "export const a = 1;");
+        put(dir.path(), "gen/deep/b.ts", "export const b = 1;");
+        put(dir.path(), "src/c.ts", "export const c = 1;");
+        put(dir.path(), "src/c.min.js", "var c;");
+        put(dir.path(), "gen/tsconfig.json", "{}");
+
+        let walked = walk(dir.path(), &never).expect("walk");
+
+        assert_eq!(marked(&walked), vec!["gen/a.ts", "gen/deep/b.ts", "src/c.min.js"]);
+        // `.gitattributes` itself is never an entry, and a manifest is read whatever the path says
+        assert!(!rels(&walked).contains(&".gitattributes"));
+
+        let manifest = walked
+            .entries
+            .iter()
+            .find(|e| e.rel == "gen/tsconfig.json")
+            .expect("manifest");
+
+        assert_eq!(read_text(dir.path(), manifest), Read::Text("{}".into()));
+
+        let marked_file = walked.entries.iter().find(|e| e.rel == "gen/a.ts").expect("file");
+
+        assert_eq!(read_text(dir.path(), marked_file), Read::Skipped(Skip::Generated));
+    }
+
+    #[test]
+    fn a_page_is_marked_by_the_attributes_and_skipped_as_generated_content_like_any_source() {
+        let dir = root();
+
+        put(dir.path(), "ui/.gitattributes", "index.html linguist-generated\n");
+        put(dir.path(), "ui/index.html", "<p>x</p>");
+        put(dir.path(), "ui/other.html", &format!("<p>{}</p>", "x".repeat(6_000)));
+        put(dir.path(), "ui/plain.html", "<p>x</p>");
+
+        let walked = walk(dir.path(), &never).expect("walk");
+        let read = |rel: &str| {
+            let entry = walked.entries.iter().find(|e| e.rel == rel).expect("entry");
+
+            read_text(dir.path(), entry)
+        };
+
+        assert_eq!(marked(&walked), vec!["ui/index.html"]);
+        assert_eq!(read("ui/index.html"), Read::Skipped(Skip::Generated));
+        assert_eq!(read("ui/other.html"), Read::Skipped(Skip::Generated));
+        assert_eq!(read("ui/plain.html"), Read::Text("<p>x</p>".into()));
+    }
+
+    #[test]
+    fn the_last_line_wins_and_the_three_cancel_forms_unset() {
+        let dir = root();
+
+        put(
+            dir.path(),
+            ".gitattributes",
+            "a/** linguist-generated\n\
+             a/dash.ts -linguist-generated\n\
+             a/bang.ts !linguist-generated\n\
+             a/false.ts linguist-generated=false\n\
+             a/again.ts linguist-generated\n\
+             a/line.ts -linguist-generated linguist-generated\n\
+             a/other.ts text linguist-generated -text\n\
+             # a/comment.ts linguist-generated\n\
+             !a/negated.ts linguist-generated\n\
+             a/plain.ts text\n\
+             [attr]macro linguist-generated\n",
+        );
+
+        for name in [
+            "dash", "bang", "false", "again", "line", "other", "comment", "negated", "plain",
+        ] {
+            put(dir.path(), &format!("a/{name}.ts"), "export const x = 1;");
+        }
+
+        // the later cancel beats the earlier set, and a later set beats a cancel
+        let walked = walk(dir.path(), &never).expect("walk");
+
+        assert_eq!(
+            marked(&walked),
+            vec![
+                "a/again.ts",
+                "a/comment.ts",
+                "a/line.ts",
+                "a/negated.ts",
+                "a/other.ts",
+                "a/plain.ts"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_nested_file_overrides_the_root_and_its_patterns_are_relative_to_its_folder() {
+        let dir = root();
+
+        put(
+            dir.path(),
+            ".gitattributes",
+            "gen/** linguist-generated\n/top.ts linguist-generated\n",
+        );
+        put(dir.path(), "gen/.gitattributes", "keep.ts -linguist-generated\n");
+        put(
+            dir.path(),
+            "gen/sub/.gitattributes",
+            "x.ts linguist-generated\n/y.ts linguist-generated\n",
+        );
+
+        for rel in [
+            "top.ts",
+            "sub/top.ts",
+            "gen/keep.ts",
+            "gen/sub/keep.ts",
+            "gen/other.ts",
+            "x.ts",
+            "gen/x.ts",
+            "gen/sub/x.ts",
+            "gen/sub/deep/x.ts",
+            "gen/sub/y.ts",
+            "gen/sub/deep/y.ts",
+            "gen/y.ts",
+        ] {
+            put(dir.path(), rel, "export const x = 1;");
+        }
+
+        let walked = walk(dir.path(), &never).expect("walk");
+
+        assert_eq!(
+            marked(&walked),
+            vec![
+                "gen/other.ts",
+                "gen/sub/deep/x.ts",
+                "gen/sub/deep/y.ts",
+                "gen/sub/x.ts",
+                "gen/sub/y.ts",
+                "gen/x.ts",
+                "gen/y.ts",
+                "top.ts"
+            ],
+            "/top.ts is anchored to the root; keep.ts has no slash, so gen/.gitattributes cancels it at every depth \
+             below gen/; gen/sub/deep/y.ts is only reached by the root gen/**, since /y.ts is anchored to gen/sub/"
+        );
+    }
+
+    #[test]
+    fn a_folder_name_and_a_trailing_slash_reach_no_file_as_in_git() {
+        let dir = root();
+
+        put(
+            dir.path(),
+            ".gitattributes",
+            "gen linguist-generated\nout/ linguist-generated\n",
+        );
+        put(dir.path(), "gen/a.ts", "export const a = 1;");
+        put(dir.path(), "out/b.ts", "export const b = 1;");
+        put(dir.path(), "src/out", "");
+
+        assert!(marked(&walk(dir.path(), &never).expect("walk")).is_empty());
+    }
+
+    #[test]
+    fn a_quoted_pattern_with_a_space_is_read() {
+        let dir = root();
+
+        put(dir.path(), ".gitattributes", "\"my dir/**\" linguist-generated\n");
+        put(dir.path(), "my dir/a.ts", "export const a = 1;");
+        put(dir.path(), "mydir/a.ts", "export const a = 1;");
+
+        assert_eq!(marked(&walk(dir.path(), &never).expect("walk")), vec!["my dir/a.ts"]);
+    }
+
+    #[test]
+    fn info_attributes_of_a_real_git_folder_outrank_every_gitattributes() {
+        let dir = root();
+
+        put(
+            dir.path(),
+            ".git/info/attributes",
+            "info.ts linguist-generated\nboth.ts -linguist-generated\n",
+        );
+        put(
+            dir.path(),
+            ".gitattributes",
+            "info.ts -linguist-generated\nboth.ts linguist-generated\n",
+        );
+        put(dir.path(), "info.ts", "export const a = 1;");
+        put(dir.path(), "both.ts", "export const b = 1;");
+
+        assert_eq!(marked(&walk(dir.path(), &never).expect("walk")), vec!["info.ts"]);
+    }
+
+    #[test]
+    fn info_attributes_without_a_git_folder_are_not_read() {
+        let dir = root();
+
+        put(dir.path(), "info/attributes", "a.ts linguist-generated\n");
+        put(dir.path(), "a.ts", "export const a = 1;");
+
+        assert!(marked(&walk(dir.path(), &never).expect("walk")).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_git_info_folder_gives_neither_attributes_nor_exclusions() {
+        use std::os::unix::fs::symlink;
+
+        let outside = root();
+
+        put(outside.path(), "attributes", "a.ts linguist-generated\n");
+        put(outside.path(), "exclude", "b.ts\n");
+
+        for target in [outside.path().to_path_buf(), PathBuf::from("rules")] {
+            let dir = root();
+
+            put(dir.path(), "rules/attributes", "a.ts linguist-generated\n");
+            put(dir.path(), "rules/exclude", "b.ts\n");
+            put(dir.path(), ".git/HEAD", "ref: refs/heads/main\n");
+            put(dir.path(), "a.ts", "export const a = 1;");
+            put(dir.path(), "b.ts", "export const b = 1;");
+
+            let target = if target.is_relative() {
+                dir.path().join(target)
+            } else {
+                target
+            };
+
+            symlink(&target, dir.path().join(".git/info")).expect("link");
+
+            let walked = walk(dir.path(), &never).expect("walk");
+            let found: Vec<&str> = walked.entries.iter().map(|entry| entry.rel.as_str()).collect();
+
+            assert!(marked(&walked).is_empty(), "{target:?}");
+            assert!(
+                found.contains(&"a.ts") && found.contains(&"b.ts"),
+                "{target:?}: {found:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_or_oversized_attributes_file_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let outside = root();
+
+        put(outside.path(), "attrs", "*.ts linguist-generated\n");
+
+        let dir = root();
+
+        symlink(outside.path().join("attrs"), dir.path().join(".gitattributes")).expect("link");
+        put(dir.path(), "a.ts", "export const a = 1;");
+
+        let walked = walk(dir.path(), &never).expect("walk");
+
+        assert!(marked(&walked).is_empty());
+        assert_eq!(walked.skipped.unsafe_or_large, 1);
+
+        let big = root();
+        let lines = "*.ts linguist-generated\n".repeat(MAX_IGNORE_BYTES as usize / 20);
+
+        put(big.path(), ".gitattributes", &lines);
+        put(big.path(), "a.ts", "export const a = 1;");
+
+        let walked = walk(big.path(), &never).expect("walk");
+
+        assert!(marked(&walked).is_empty());
+        assert_eq!(walked.skipped.unsafe_or_large, 1);
+    }
+
+    #[test]
+    fn a_large_attributes_file_does_not_use_up_the_budget_of_the_ignore_files() {
+        let dir = root();
+        // about 250 KB of valid lines: enough to exhaust a budget they would share
+        let lines = "x.ts linguist-generated\n".repeat(100);
+
+        // an ignore budget that this file would use up if it were charged to it
+        let limits = Limits {
+            ignore_bytes: lines.len() / 2,
+            ..Limits::default()
+        };
+
+        put(dir.path(), ".gitattributes", &lines);
+        put(dir.path(), "sub/.gitignore", "skipped/\n");
+        put(dir.path(), "sub/skipped/a.ts", "export const a = 1;");
+        put(dir.path(), "sub/kept.ts", "export const b = 1;");
+
+        let walked = walk_with(dir.path(), &never, limits).expect("walk");
+
+        assert_eq!(rels(&walked), vec!["sub/kept.ts"]);
+        assert_eq!(walked.skipped.unsafe_or_large, 0);
+    }
+
+    #[test]
+    fn a_repository_with_only_a_gitattributes_file_walks_to_nothing() {
+        let dir = root();
+
+        put(dir.path(), ".gitattributes", "* linguist-generated\n");
+
+        let walked = walk(dir.path(), &never).expect("walk");
+
+        assert!(walked.entries.is_empty());
+        assert_eq!(walked.skipped, Skipped::default());
     }
 
     #[test]

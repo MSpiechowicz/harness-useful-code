@@ -1,0 +1,23 @@
+.card {
+  border: 1px solid;
+}
+
+.card--on {
+  color: blue;
+}
+
+.title {
+  font-weight: bold;
+}
+
+.badge {
+  color: red;
+}
+
+.badge--warm {
+  color: orange;
+}
+
+.note {
+  color: gray;
+}

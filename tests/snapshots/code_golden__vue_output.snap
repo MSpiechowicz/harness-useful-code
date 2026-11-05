@@ -17,7 +17,7 @@ component Counter  src/Counter.vue:1-9
   uses:
     useCounter src/composables/useCounter.ts:3  at src/Counter.vue:4 | const { count, increment } = useCounter(1);
   used by 1 site(s):
-    src/App.vue:6 App | <Counter />
+    src/App.vue:6 App
 
 == symbol useCounter
 fn useCounter  src/composables/useCounter.ts:3-11

@@ -90,6 +90,12 @@ impl Graph {
                 continue;
             };
 
+            // a class a file writes says nothing about which file the code is built around: the order of a map
+            // does not change when a component gains a `className`
+            if self.is_class(ri) {
+                continue;
+            }
+
             // a name matched by its name alone, or a constant read (a table, a config object), says less about which
             // file the code is built around than a call does
             let soft =

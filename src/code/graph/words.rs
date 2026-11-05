@@ -282,6 +282,14 @@ fn has_part(joined: &str, word: &str) -> bool {
     })
 }
 
+/// Words that mean the stylesheets of a repository for a `code_map` query, whatever their extension. `class` is not
+/// one: on its own it is as likely to mean the code. `less` is not one either: it is an everyday word, and a `.less`
+/// file holds it as its extension anyway.
+const SHEET_WORDS: &[&str] = &["css", "scss", "sass", "style", "styles", "stylesheet", "stylesheets"];
+
+/// Files below this many are too few to call a word that most of them hold common.
+const COMMON_PATH_FLOOR: usize = 4;
+
 /// How each word matches one definition (0 = not at all).
 type Tiers = [u8; MAX_QUERY_WORDS];
 
@@ -289,6 +297,80 @@ type Tiers = [u8; MAX_QUERY_WORDS];
 type Matches = HashMap<usize, Tiers>;
 
 impl Graph {
+    /// The files (no tests, only under `scope`) the words of `query` mean when no definition holds them: those that
+    /// hold the most of the words in their folders, name or extension (`styles` for `src/styles/a.css`, `scss` for
+    /// `a.scss`). A word most of the paths hold says nothing and counts for no file. A word of [`SHEET_WORDS`] counts
+    /// double, and when no path can tell by it (`scss` in a repository of `.css`), it counts for the files that hold
+    /// styles.
+    pub(super) fn files_of_words(&self, query: &str, scope: Option<&str>) -> Vec<usize> {
+        let live: Vec<usize> = (0..self.files.len())
+            .filter(|file| self.in_scope(*file, scope) && self.files.get(*file).is_some_and(|f| !f.test))
+            .collect();
+        let parts: Vec<Vec<String>> = live
+            .iter()
+            .filter_map(|file| self.files.get(*file))
+            .map(|file| {
+                file.path
+                    .split(['/', '.'])
+                    .flat_map(segments)
+                    .map(|part| singular(&part).to_string())
+                    .collect()
+            })
+            .collect();
+        let mut held = vec![0_usize; live.len()];
+
+        for word in query_words(query) {
+            let sheet_word = SHEET_WORDS.contains(&word.as_str());
+            let written = singular(&word);
+            let mut holders: Vec<usize> = parts
+                .iter()
+                .enumerate()
+                .filter(|(_, parts)| parts.iter().any(|part| part == written))
+                .map(|(at, _)| at)
+                .collect();
+
+            // every path holding it says nothing, however few there are
+            if live.len() > 1 && holders.len() == live.len()
+                || live.len() > COMMON_PATH_FLOOR && holders.len() * 2 > live.len()
+            {
+                holders.clear();
+            }
+
+            if sheet_word && holders.is_empty() {
+                holders = (0..live.len())
+                    .filter(|at| live.get(*at).is_some_and(|file| self.holds_styles(*file)))
+                    .collect();
+            }
+
+            for at in holders {
+                if let Some(count) = held.get_mut(at) {
+                    *count += if sheet_word { 2 } else { 1 };
+                }
+            }
+        }
+
+        let most = held.iter().copied().max().unwrap_or(0);
+        let mut files: Vec<usize> = live
+            .iter()
+            .zip(&held)
+            .filter(|(_, count)| most > 0 && **count == most)
+            .map(|(file, _)| *file)
+            .collect();
+
+        files.sort_by_key(|file| self.files.get(*file).map(|f| f.path.as_str()));
+
+        files
+    }
+
+    /// True for a stylesheet, or a component with a `<style>` block that defines something.
+    fn holds_styles(&self, file: usize) -> bool {
+        self.files.get(file).is_some_and(|f| f.lang == "scss")
+            || self
+                .file_syms
+                .get(file)
+                .is_some_and(|syms| syms.iter().any(|sym| self.syms.get(*sym).is_some_and(|s| s.style)))
+    }
+
     /// The definitions the words of `query` point at, or nothing.
     pub(super) fn words_endpoint(&self, query: &str, scope: Option<&str>) -> Endpoint {
         let words = query_words(query);
@@ -368,7 +450,7 @@ impl Graph {
 
             (
                 rank(*sym, tiers),
-                std::cmp::Reverse(self.incoming.get(*sym).map_or(0, Vec::len)),
+                self.use_rank(*sym),
                 def.map_or(0, |d| d.name.len()),
                 def.and_then(|d| self.files.get(d.file)).map_or(0, |f| f.path.len()),
                 *sym,

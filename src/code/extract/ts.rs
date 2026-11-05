@@ -5,9 +5,13 @@
 
 use tree_sitter::{Language, Node, Parser};
 
+use super::classes::{
+    Binders, Constants, Vars, binders_of, class_expression_with, helper_of, selector_expression, sheet_locals,
+    sheet_source,
+};
 use super::{
-    Extract, Import, MAX_DEPTH, Placement, constant_like, ident_like, is_own_name, push_base, push_bind, push_def,
-    push_mcall, push_ref, push_ref_recv, push_use, push_word, text, written_type,
+    Extract, Import, MAX_DEPTH, Placement, constant_like, ident_like, is_name_of, out_of_time, push_base, push_bind,
+    push_def, push_mcall, push_ref, push_ref_recv, push_use_under, push_word_under, text, written_type,
 };
 
 /// Reads a TS/JS file.
@@ -65,26 +69,78 @@ pub(super) fn extract_block(
     out: &mut Extract,
 ) {
     let Some(tree) = super::parse(parser, language, src) else {
+        // nothing of the block was read, its classes included
+        out.dropped += 1;
+        out.classes_cut = true;
+
         return;
     };
 
     let imported = Imported::of(tree.root_node(), src.as_bytes());
+    let consts = Constants::of(tree.root_node(), src.as_bytes());
 
-    Walk {
+    let first = out.refs.len();
+    let mut walk = Walk {
         src: src.as_bytes(),
         line_off,
         jsx,
         sfc: owner.is_some(),
         imported,
+        consts,
         class_sym: None,
+        ticks: 0,
+        ancestors: Vec::new(),
+        stopped: false,
+        spans: Vec::new(),
         out,
+    };
+
+    walk.node(tree.root_node(), None, owner, None, 0);
+
+    let spans = std::mem::take(&mut walk.spans);
+
+    mark_shared_lines(out, first, &spans, line_off);
+}
+
+/// Marks the references of this block (from `first` on) that sit on a line a JSX node is written on, whatever
+/// they are: `const y = f(); const x = <div>text</div>` and `return target(<p>text</p>)` show the text of a page
+/// on the line of `f` and `target`, and a line that ends a node holds its text too. `spans` (first and last 0-based
+/// row of each outermost JSX node, by first row as the walk met them) are merged in one pass, then each reference
+/// finds its span by bisection, so the cost is that of the references.
+fn mark_shared_lines(out: &mut Extract, first: usize, spans: &[(usize, usize)], line_off: usize) {
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+
+    for &(start, end) in spans {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
     }
-    .node(tree.root_node(), owner, None, 0);
+
+    if merged.is_empty() {
+        return;
+    }
+
+    for reference in out.refs.iter_mut().skip(first) {
+        let Some(row) = reference.line.checked_sub(line_off + 1) else {
+            continue;
+        };
+        let after = merged.partition_point(|&(_, end)| end < row);
+
+        if merged.get(after).is_some_and(|&(start, _)| start <= row) {
+            reference.markup = true;
+        }
+    }
 }
 
 /// The TypeScript grammar, for script blocks.
 pub(super) fn typescript() -> Language {
     tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+}
+
+/// The TSX grammar, for the expressions of a template.
+pub(super) fn tsx() -> Language {
+    tree_sitter_typescript::LANGUAGE_TSX.into()
 }
 
 fn def_kind(node: Node) -> Option<&'static str> {
@@ -158,6 +214,20 @@ fn collect_import(node: Node, src: &[u8], out: &mut Vec<Import>) {
 
     let source = source.to_string();
     let mut cursor = node.walk();
+
+    // `import './card.css'` brings no name: the sheet is read for its side effect, and its classes are the
+    // file's own
+    if !node.named_children(&mut cursor).any(|c| c.kind() == "import_clause") {
+        if let Some(sheet) = sheet_source(&source) {
+            out.push(Import {
+                local: format!("sheet:{sheet}"),
+                orig: "*".into(),
+                source: sheet.to_string(),
+            });
+        }
+
+        return;
+    }
 
     for clause in node.named_children(&mut cursor).filter(|c| c.kind() == "import_clause") {
         let mut inner = clause.walk();
@@ -358,6 +428,11 @@ struct Imported {
     values: std::collections::HashSet<String>,
     /// Namespace imports (`import * as ns`): `ns.member` names an export of the module.
     namespaces: std::collections::HashSet<String>,
+    /// The names that stand for a stylesheet module (`import styles from './a.module.css'`): `styles.card` is a
+    /// class.
+    sheets: std::collections::HashSet<String>,
+    /// The file's own class helpers made with `classNames.bind(styles)`, and the module each is bound to.
+    binders: Binders,
 }
 
 impl Imported {
@@ -372,10 +447,14 @@ impl Imported {
             collect_import(statement, src, &mut imports);
         }
 
+        let sheets = sheet_locals(&imports);
+        let binders = binders_of(root, src, &sheets, &imports);
         let (namespaces, values): (Vec<Import>, Vec<Import>) =
             imports.into_iter().partition(|import| import.orig == "*");
 
         Self {
+            sheets,
+            binders,
             values: values.into_iter().map(|import| import.local).collect(),
             namespaces: namespaces.into_iter().map(|import| import.local).collect(),
         }
@@ -390,10 +469,31 @@ struct Walk<'a> {
     sfc: bool,
     /// What this file (or script block) imports: such a name is a value of another file in any case.
     imported: Imported,
+    /// The `const` declarations of the file, for a class position that names one.
+    consts: Constants<'a>,
     /// The class or interface whose body is being read.
     class_sym: Option<usize>,
+    /// Nodes visited, so the clock is read once in [`CLOCK_EVERY`] of them.
+    ticks: usize,
+    /// The nodes from the root down to the one whose children are being read: the parent of a parent is one step
+    /// away, where asking the tree costs the width of the parent's siblings.
+    ancestors: Vec<Node<'a>>,
+    /// The file's time ran out: the rest of the tree is not read.
+    stopped: bool,
+    /// The first and last row of each outermost JSX node, in the order the walk meets them (so by first row).
+    spans: Vec<(usize, usize)>,
     out: &'a mut Extract,
 }
+
+/// True for the name of an attribute or a key that holds class names: `class`, `className`, and a name that
+/// ends in `ClassName` (`wrapperClassName`). Not `classes`, `sx` or `style`.
+fn class_name(name: &str) -> bool {
+    matches!(name, "class" | "className") || (name.len() > "ClassName".len() && name.ends_with("ClassName"))
+}
+
+/// Nodes between two looks at the clock. A visit is cheap in a tree of ordinary shape and slow in one of a
+/// hostile shape (a millisecond or more), so the clock is read often: a read costs a few visits at most.
+const CLOCK_EVERY: usize = 8;
 
 /// Deeper receiver expressions are not followed.
 const MAX_EXPR_DEPTH: usize = 12;
@@ -476,7 +576,7 @@ fn returns(node: Node, src: &[u8]) -> Option<String> {
 /// True when an identifier stands for a value there: not a declared name, a callee, a parameter, a tag or
 /// the object of a member access.
 fn value_position(node: Node, parent: Node) -> bool {
-    if is_own_name(node) {
+    if is_name_of(node, Some(parent)) {
         return false;
     }
 
@@ -618,9 +718,10 @@ fn function_values(value: Node, src: &[u8], depth: usize, found: &mut Vec<String
 }
 
 /// The function an object literal is passed to as an argument (`create({ .. })`, `new Runner({ .. })`,
-/// `Runner.create({ .. })`): its name as written, or its last name for a member.
-fn passed_to(object: Node, src: &[u8]) -> Option<String> {
-    let mut at = object.parent()?;
+/// `Runner.create({ .. })`): its name as written, or its last name for a member. `parent` is the parent of the
+/// object, which the caller has at hand.
+fn passed_to(parent: Option<Node>, src: &[u8]) -> Option<String> {
+    let mut at = parent?;
 
     while matches!(
         at.kind(),
@@ -659,9 +760,38 @@ fn base_name(node: Node, src: &[u8]) -> Option<String> {
     }
 }
 
-impl Walk<'_> {
-    fn node(&mut self, node: Node, current: Option<usize>, ctx: Option<&str>, depth: usize) {
+impl<'a> Walk<'a> {
+    fn node(
+        &mut self,
+        node: Node<'a>,
+        parent: Option<Node<'a>>,
+        current: Option<usize>,
+        ctx: Option<&str>,
+        depth: usize,
+    ) {
+        if self.stopped {
+            return;
+        }
+
+        // a subtree past the depth is not read, and may hold class uses: the file says so
         if depth > MAX_DEPTH {
+            self.out.dropped += 1;
+            self.out.classes_cut = true;
+
+            return;
+        }
+
+        // the parse is bounded by its own clock, but a tree the parser made quickly can still be slow to walk (a
+        // flat node of thousands of children asks for the parent of each): the walk gives up with the file's time
+        self.ticks += 1;
+
+        if self.ticks.is_multiple_of(CLOCK_EVERY) && out_of_time() {
+            self.stopped = true;
+
+            // what is left of the file is not read, its classes included
+            self.out.dropped += 1;
+            self.out.classes_cut = true;
+
             return;
         }
 
@@ -732,16 +862,38 @@ impl Walk<'_> {
             return;
         }
 
-        self.reference(node, current, line);
-        self.binding(node, enclosing, current, ctx);
+        // a reference inside a JSX element sits where a line of source holds the text of the page (a child line has
+        // no tag on it, a text node spans lines), so it is marked as written in markup. The flag is saved and put
+        // back around the children: one write per JSX node, no walk up the parents. A function body in an
+        // attribute (`onClick={() => { doIt(); }}`) is script on lines of its own but is marked as well: it is
+        // told apart from the markup around it by nothing a single line shows.
+        let was_markup = self.out.in_markup;
+
+        if matches!(node.kind(), "jsx_element" | "jsx_self_closing_element" | "jsx_fragment") {
+            // the rows of an outermost JSX node are kept: any other reference on one of them shares its line with
+            // markup, whatever it is (see [`mark_shared_lines`])
+            if !was_markup {
+                self.spans.push((node.start_position().row, node.end_position().row));
+            }
+
+            self.out.in_markup = true;
+        }
+
+        self.reference(node, parent, current, line);
+        self.binding(node, parent, enclosing, current, ctx);
 
         let ctx_next = owner.as_deref().or(ctx);
         let mut cursor = node.walk();
 
+        self.ancestors.push(node);
+
         for child in node.children(&mut cursor) {
-            self.node(child, current, ctx_next, depth + 1);
+            self.node(child, Some(node), current, ctx_next, depth + 1);
         }
 
+        self.ancestors.pop();
+
+        self.out.in_markup = was_markup;
         self.class_sym = saved_class;
     }
 
@@ -793,7 +945,14 @@ impl Walk<'_> {
     }
 
     /// The written types a node declares: variables, parameters, fields, members and enum members.
-    fn binding(&mut self, node: Node, enclosing: Option<usize>, current: Option<usize>, ctx: Option<&str>) {
+    fn binding(
+        &mut self,
+        node: Node,
+        parent: Option<Node>,
+        enclosing: Option<usize>,
+        current: Option<usize>,
+        ctx: Option<&str>,
+    ) {
         let src = self.src;
 
         match node.kind() {
@@ -895,7 +1054,7 @@ impl Walk<'_> {
                 }
 
                 if matches!(value.kind(), "arrow_function" | "function_expression" | "function") {
-                    if let Some(object) = node.parent() {
+                    if let Some(object) = parent {
                         let owner = object_type(object, src);
 
                         self.member(node, key, owner.as_deref().unwrap_or(""), value);
@@ -904,20 +1063,20 @@ impl Walk<'_> {
                     let mut values = Vec::new();
 
                     function_values(value, src, 0, &mut values);
-                    self.properties(node, text(key, src), &values, current);
+                    self.properties(node, parent, text(key, src), &values, current);
                 }
             }
             "shorthand_property_identifier" => {
                 let name = text(node, src);
 
-                self.properties(node, name, &[name.to_string()], current);
+                self.properties(node, parent, name, &[name.to_string()], current);
             }
             "enum_assignment" => {
                 if let Some(name) = node.child_by_field_name("name") {
                     self.enum_member(node, name, ctx);
                 }
             }
-            "property_identifier" if node.parent().is_some_and(|p| p.kind() == "enum_body") => {
+            "property_identifier" if parent.is_some_and(|p| p.kind() == "enum_body") => {
                 self.enum_member(node, node, ctx);
             }
             _ => {}
@@ -927,8 +1086,10 @@ impl Walk<'_> {
     /// Notes that property `key` of the object literal around `node` may hold each of `values` (a `prop`
     /// reference: the value as written in `qual`, the function the object is passed to in `recv`). Whether a
     /// value is a function is told when the graph is loaded.
-    fn properties(&mut self, node: Node, key: &str, values: &[String], from: Option<usize>) {
-        let via = node.parent().and_then(|object| passed_to(object, self.src));
+    fn properties(&mut self, node: Node, parent: Option<Node>, key: &str, values: &[String], from: Option<usize>) {
+        // the stack ends with the parent of `node`, the object literal, and the one before it is the object's parent
+        let above = self.ancestors.iter().rev().nth(1).copied();
+        let via = parent.and_then(|_| passed_to(above, self.src));
         let line = node.start_position().row + self.line_off + 1;
 
         for value in values {
@@ -962,14 +1123,148 @@ impl Walk<'_> {
         push_def(self.out, node, "enum_member", name, owner, &place);
     }
 
-    /// The reference a node itself makes, if any.
-    fn reference(&mut self, node: Node, from: Option<usize>, line: usize) {
+    /// The class tokens a node writes, if it is a place where classes are written: the `class`, `className` or
+    /// `*ClassName` of an element or an object, a call of a helper that joins class names, a member of a
+    /// stylesheet module, `x.className = ...`, the arguments of `x.classList.add(...)` and of the like, and the
+    /// selector or the class names `x.querySelector('.a')` and `x.getElementsByClassName('a')` look for. A token
+    /// the places overlap on (`className={styles.card}`) is kept once.
+    fn class_refs(&mut self, node: Node<'a>, from: Option<usize>) {
         let src = self.src;
+        let mut places: Vec<Node<'a>> = Vec::new();
+        let mut selector = false;
 
         match node.kind() {
-            "type_identifier" if !is_own_name(node) => {
-                let qual = node
-                    .parent()
+            "jsx_attribute" => {
+                let named = node
+                    .named_child(0)
+                    .filter(|name| name.kind() == "property_identifier")
+                    .is_some_and(|name| class_name(text(name, src)));
+
+                if named {
+                    places.extend(node.named_child(1));
+                }
+            }
+            "pair" => {
+                let named = node.child_by_field_name("key").is_some_and(|key| {
+                    matches!(key.kind(), "property_identifier" | "string")
+                        && class_name(text(key, src).trim_matches(['\'', '"']))
+                });
+
+                if named {
+                    places.extend(node.child_by_field_name("value"));
+                }
+            }
+            "call_expression" if helper_of(node, src, &self.imported.binders).is_some() => places.push(node),
+            "call_expression" => selector = self.method_places(node, &mut places),
+            "assignment_expression" | "augmented_assignment_expression" => {
+                let assigned = node
+                    .child_by_field_name("left")
+                    .filter(|left| left.kind() == "member_expression")
+                    .and_then(|left| left.child_by_field_name("property"))
+                    .is_some_and(|property| text(property, src) == "className");
+
+                if assigned {
+                    places.extend(node.child_by_field_name("right"));
+                }
+            }
+            "member_expression" | "subscript_expression" if !self.imported.sheets.is_empty() => places.push(node),
+            _ => {}
+        }
+
+        if places.is_empty() {
+            return;
+        }
+
+        let line_off = self.line_off;
+        let out = &mut *self.out;
+        let mut vars = Vars::new(&mut self.consts, &self.ancestors);
+
+        for place in places {
+            let emit = &mut |token: &str, qual: Option<&str>, row: usize| {
+                out.add_class(from, token, qual, row + line_off + 1);
+            };
+
+            if selector {
+                selector_expression(place, src, Some(&mut vars), emit);
+            } else {
+                class_expression_with(
+                    place,
+                    src,
+                    &self.imported.sheets,
+                    &self.imported.binders,
+                    Some(&mut vars),
+                    emit,
+                );
+            }
+        }
+
+        // a constant that was not read for want of budget: the file may have lost a class use
+        if vars.cut {
+            out.classes_cut = true;
+        }
+    }
+
+    /// The arguments of a method call that name classes, pushed on `places`: `x.classList.add|remove(...)` (all
+    /// of them), `x.classList.toggle|contains(first)`, `x.classList.replace(old, new)`, `x.getElementsByClassName(a)`
+    /// and `x.querySelector|querySelectorAll|closest|matches(selector)`. True when the places are selectors. The
+    /// call must be a method call (`x.name(...)`): a function of the same name that is no method says nothing.
+    fn method_places(&self, call: Node<'a>, places: &mut Vec<Node<'a>>) -> bool {
+        let src = self.src;
+        let Some(function) = call
+            .child_by_field_name("function")
+            .filter(|function| function.kind() == "member_expression")
+        else {
+            return false;
+        };
+        let Some(method) = function.child_by_field_name("property").map(|name| text(name, src)) else {
+            return false;
+        };
+        let Some(arguments) = call.child_by_field_name("arguments") else {
+            return false;
+        };
+        let (count, selector) = match method {
+            "add" | "remove" | "toggle" | "contains" | "replace" => {
+                let on_list = function
+                    .child_by_field_name("object")
+                    .filter(|object| object.kind() == "member_expression")
+                    .and_then(|object| object.child_by_field_name("property"))
+                    .is_some_and(|property| text(property, src) == "classList");
+
+                if !on_list {
+                    return false;
+                }
+
+                match method {
+                    "add" | "remove" => (usize::MAX, false),
+                    "replace" => (2, false),
+                    _ => (1, false),
+                }
+            }
+            "getElementsByClassName" => (1, false),
+            "querySelector" | "querySelectorAll" | "closest" | "matches" => (1, true),
+            _ => return false,
+        };
+        let mut cursor = arguments.walk();
+
+        places.extend(
+            arguments
+                .named_children(&mut cursor)
+                .filter(|argument| argument.kind() != "comment")
+                .take(count),
+        );
+
+        selector
+    }
+
+    /// The reference a node itself makes, if any.
+    fn reference(&mut self, node: Node<'a>, parent: Option<Node>, from: Option<usize>, line: usize) {
+        let src = self.src;
+
+        self.class_refs(node, from);
+
+        match node.kind() {
+            "type_identifier" if !is_name_of(node, parent) => {
+                let qual = parent
                     .filter(|parent| parent.kind() == "nested_type_identifier")
                     .and_then(|parent| parent.child_by_field_name("module"))
                     .map(|module| text(module, src).to_string());
@@ -1012,7 +1307,7 @@ impl Walk<'_> {
             // names passed as strings: IPC commands, event names, routes, registries
             // a function passed as a value (`app.get(path, handler)`, `rows.map(format)`), or a constant
             "identifier" => {
-                let Some(parent) = node.parent() else {
+                let Some(parent) = parent else {
                     return;
                 };
                 let name = text(node, src);
@@ -1026,12 +1321,12 @@ impl Walk<'_> {
                 let imported = self.imported.values.contains(name) && imported_position(node, parent);
 
                 if imported || (constant_like(name) && value_position(node, parent)) {
-                    push_use(self.out, from, name, None, node, src, line);
+                    push_use_under(self.out, from, name, None, node, Some(parent), src, line);
                 }
             }
             // `{ siteContent }`: the shorthand of an imported name passes its value on
             "shorthand_property_identifier" if self.imported.values.contains(text(node, src)) => {
-                push_use(self.out, from, text(node, src), None, node, src, line);
+                push_use_under(self.out, from, text(node, src), None, node, parent, src, line);
             }
             "member_expression" => {
                 // `Color.Red`, `limits.MAX_ROWS`: a constant named through its owner
@@ -1047,17 +1342,18 @@ impl Walk<'_> {
                 if object.kind() == "identifier"
                     && property.kind() == "property_identifier"
                     && named
-                    && !node.parent().is_some_and(|p| {
+                    && !parent.is_some_and(|p| {
                         p.kind() == "call_expression"
                             && p.child_by_field_name("function").is_some_and(|f| f.id() == node.id())
                     })
                 {
-                    push_use(
+                    push_use_under(
                         self.out,
                         from,
                         name,
                         Some(text(object, src).to_string()),
                         node,
+                        parent,
                         src,
                         line,
                     );
@@ -1068,9 +1364,9 @@ impl Walk<'_> {
 
                 if ident_like(value) {
                     push_ref(self.out, from, value, "str", None, line);
-                } else if !node.parent().is_some_and(|parent| parent.kind().starts_with("jsx_")) {
+                } else if !parent.is_some_and(|parent| parent.kind().starts_with("jsx_")) {
                     // a class name or other markup attribute is no command
-                    push_word(self.out, from, value, node, src);
+                    push_word_under(self.out, from, value, node, parent, src);
                 }
             }
             "new_expression" => {
@@ -1183,6 +1479,497 @@ mod tests {
         );
     }
 
+    /// The class tokens of a file as sorted (token, qualifier).
+    fn classes(out: &Extract) -> Vec<(String, Option<String>)> {
+        let mut found: Vec<(String, Option<String>)> = out
+            .refs
+            .iter()
+            .filter(|r| r.kind == "cls")
+            .map(|r| (r.name.clone(), r.qual.clone()))
+            .collect();
+
+        found.sort();
+
+        found
+    }
+
+    fn tokens(out: &Extract) -> Vec<String> {
+        classes(out).into_iter().map(|(name, _)| name).collect()
+    }
+
+    #[test]
+    fn a_class_attribute_and_the_class_helpers_name_their_classes() {
+        let out = run(
+            "src/A.tsx",
+            "import clsx from 'clsx';\nexport function A({ cond, x }) {\n  return <div className=\"a b\" id=\"nope\">\
+             <p className={cn('c', cond && 'd', { e: x, 'f-g': x }, ['h'])} class={clsx(cond ? 'i' : 'j')} />\
+             <i className={`k ${x} l m-${x}`} /></div>;\n}\n\
+             const t = classnames('n'); const u = classNames('o'); const v = twMerge('p q');\n",
+        );
+
+        assert_eq!(
+            tokens(&out),
+            [
+                "a", "b", "c", "d", "e", "f-g", "h", "i", "j", "k", "l", "n", "o", "p", "q"
+            ]
+        );
+        assert!(out.refs.iter().filter(|r| r.kind == "cls").all(|r| !r.style));
+    }
+
+    #[test]
+    fn the_line_of_a_class_is_the_line_it_is_written_on() {
+        let out = run(
+            "src/A.tsx",
+            "const a = <p\n className=\"x\n  y\" />;\nconst b = clsx(\n 'z');\n",
+        );
+        let lines: Vec<(&str, usize)> = out
+            .refs
+            .iter()
+            .filter(|r| r.kind == "cls")
+            .map(|r| (r.name.as_str(), r.line))
+            .collect();
+
+        assert_eq!(lines, vec![("x", 2), ("y", 3), ("z", 5)]);
+    }
+
+    #[test]
+    fn a_condition_or_a_string_outside_a_class_position_is_no_class() {
+        let out = run(
+            "src/A.tsx",
+            "export function A({ cond }) {\n  const s = 'card'; fn('card'); const o = { title: 'card', kind: 'box' };\n\
+             return <p title=\"card\" className={cond === 'x' ? 'a' : 'b'} />;\n}\n\
+             const w = clsx(mode === 'dark' && 'z', k ?? 'y');\n",
+        );
+
+        assert_eq!(tokens(&out), ["a", "b", "y", "z"]);
+    }
+
+    #[test]
+    fn an_object_key_named_class_holds_classes_and_a_plain_key_does_not() {
+        let out = run(
+            "src/a.ts",
+            "const props = { class: 'one two', className: ['three'], 'class': 'four', id: 'five', label: 'six' };\n",
+        );
+
+        assert_eq!(tokens(&out), ["four", "one", "three", "two"]);
+    }
+
+    #[test]
+    fn cva_reads_its_base_variant_values_and_compound_classes_but_no_names() {
+        let out = run(
+            "src/button.ts",
+            "export const button = cva('base-a base-b', {\n  variants: {\n    intent: { primary: 'p-1', secondary: ['s-1', 's-2'] },\n    size: { sm: 'text-sm' },\n  },\n\
+             compoundVariants: [{ intent: 'primary', size: 'sm', class: 'combo' }],\n  defaultVariants: { intent: 'primary', size: 'sm' },\n});\n",
+        );
+
+        assert_eq!(
+            tokens(&out),
+            ["base-a", "base-b", "combo", "p-1", "s-1", "s-2", "text-sm"]
+        );
+    }
+
+    #[test]
+    fn a_word_that_is_no_token_makes_none() {
+        let out = run(
+            "src/A.tsx",
+            "const a = clsx('md:flex w-[10px] !x w-1/2 hover:bg-red ok', `btn-${x} ${y} a${z}`, 'sk_live_abcdefghijklmnop');\n",
+        );
+
+        assert_eq!(tokens(&out), ["ok"]);
+    }
+
+    #[test]
+    fn a_class_is_kept_whatever_the_definition_around_it_is_named() {
+        let out = run(
+            "src/A.tsx",
+            "export const AuthLayout = () => <div className=\"auth-box\" />;\n\
+             export function Keyboard() { return clsx('key-cap'); }\n\
+             export function Monkey() { return clsx('banana'); }\n\
+             export function Author() { return clsx('by-line'); }\n\
+             export function TokenInput() { return clsx('token-box'); }\n\
+             function f() { const password = clsx('pw-box'); return password; }\n",
+        );
+
+        assert_eq!(
+            tokens(&out),
+            ["auth-box", "banana", "by-line", "key-cap", "pw-box", "token-box"]
+        );
+        // a token that holds a credential is still not kept
+        let key = ["gh", "p_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"].concat();
+
+        assert!(tokens(&run("src/A.tsx", &format!("const a = clsx('{key}', 'ok');\n"))) == ["ok"]);
+    }
+
+    #[test]
+    fn a_name_is_followed_to_its_constant_unless_it_means_a_secret() {
+        let out = run(
+            "src/A.tsx",
+            "const authCard = 'auth-card'; const keyClass = 'key-class'; const password = 'pw-shown'; const apiKey = 'api-shown'; const authToken = 'tk-shown';\n\
+             export const A = () => <p className={clsx(authCard, keyClass, password, apiKey, authToken)} />;\n",
+        );
+
+        assert_eq!(tokens(&out), ["auth-card", "key-class"]);
+    }
+
+    #[test]
+    fn a_constant_in_a_method_is_read_though_the_method_has_its_name() {
+        let out = run(
+            "src/A.tsx",
+            "class A { foo() { const foo = 'inner-class'; return <p className={foo} />; } }\n",
+        );
+
+        assert_eq!(tokens(&out), ["inner-class"]);
+    }
+
+    #[test]
+    fn names_that_find_nothing_are_paid_for_and_a_file_of_them_says_it_lost_uses() {
+        let names: Vec<String> = (0..9_000).map(|n| format!("n{n}")).collect();
+        let out = run(
+            "src/A.tsx",
+            &format!(
+                "export const A = () => <p className={{clsx({})}} />;\n",
+                names.join(", ")
+            ),
+        );
+
+        assert!(out.classes_cut);
+        assert!(!run("src/A.tsx", "export const A = () => <p className={clsx(a, b)} />;\n").classes_cut);
+    }
+
+    #[test]
+    fn a_tree_past_the_depth_marks_the_file_as_cut() {
+        let deep = format!("const a = {}1{};\nclsx('x-y');\n", "[".repeat(450), "]".repeat(450));
+        let out = run("src/A.ts", &deep);
+
+        assert!(out.classes_cut);
+        assert!(out.dropped > 0);
+        assert!(!run("src/A.ts", "const a = [1];\n").classes_cut);
+    }
+
+    #[test]
+    fn a_reference_on_a_line_that_holds_markup_is_marked_whatever_it_is() {
+        let out = run(
+            "a.tsx",
+            "export function A() {\n  const y = f(); const x = <div>text</div>;\n  return target(<p>text</p>);\n  const z = c ? other() : <b>text</b>;\n  const w = <div\n    a={b}\n  >hi</div>; after();\n  plain();\n}\n",
+        );
+        let marked = |name: &str| out.refs.iter().find(|r| r.name == name).map(|r| r.markup);
+
+        assert_eq!(marked("f"), Some(true));
+        assert_eq!(marked("target"), Some(true));
+        assert_eq!(marked("other"), Some(true));
+        assert_eq!(marked("after"), Some(true));
+        assert_eq!(marked("plain"), Some(false));
+    }
+
+    #[test]
+    fn a_member_of_an_imported_stylesheet_is_a_class_of_that_module_only() {
+        let out = run(
+            "src/A.tsx",
+            "import styles from './A.module.css?inline';\nimport other from './other';\nimport * as ns from './b.scss';\n\
+             export const A = () => <p className={styles.card} id={styles['row-x']}>{other.skip}{ns.deep}</p>;\n\
+             const c = styles.free; const d = other.nope;\n",
+        );
+
+        assert_eq!(
+            classes(&out),
+            vec![
+                ("card".to_string(), Some("styles".to_string())),
+                ("deep".to_string(), Some("ns".to_string())),
+                ("free".to_string(), Some("styles".to_string())),
+                ("row-x".to_string(), Some("styles".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sheet_import_without_a_name_is_recorded_and_other_import_tables_are_unchanged() {
+        let out = run(
+            "src/A.tsx",
+            "import './card.css';\nimport 'polyfill';\nimport './x.scss?raw';\nimport 'https://cdn.example/a.css';\nimport a from './a';\n",
+        );
+        let imports: Vec<(&str, &str, &str)> = out
+            .imports
+            .iter()
+            .map(|i| (i.local.as_str(), i.orig.as_str(), i.source.as_str()))
+            .collect();
+
+        assert_eq!(
+            imports,
+            vec![
+                ("sheet:./card.css", "*", "./card.css"),
+                ("sheet:./x.scss", "*", "./x.scss"),
+                ("a", "a", "./a"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_repeated_token_is_kept_once_and_a_thousand_and_first_marks_the_file() {
+        let out = run(
+            "src/A.tsx",
+            "function f() { clsx('x', 'x'); return clsx('x'); }\nfunction g() { return clsx('x'); }\n",
+        );
+
+        // once for each definition that writes it
+        assert_eq!(tokens(&out), ["x", "x"]);
+        assert!(!out.classes_cut);
+
+        let many: Vec<String> = (0..1_001).map(|n| format!("c{n}")).collect();
+        let out = run("src/B.tsx", &format!("const a = clsx('{}');\n", many.join(" ")));
+
+        assert_eq!(tokens(&out).len(), 1_000);
+        assert!(out.classes_cut);
+    }
+
+    #[test]
+    fn a_helper_bound_to_a_stylesheet_module_reaches_that_module_only() {
+        let out = run(
+            "src/A.tsx",
+            "import classNames from 'classnames/bind';\nimport styles from './a.module.css';\nimport other from './b.module.css';\n\
+             const cx = classNames.bind(styles);\nconst global = classnames.bind(somewhere);\nexport const ox = classNames.bind(other);\n\
+             export function A({ on }) {\n  return <div className={cx('card', { active: on }, on && 'lit')} id={global('plain')}>\n\
+             <i className={ox('o')} /><b className={cx('a', clsx('g'))} /></div>;\n}\n",
+        );
+
+        assert_eq!(
+            classes(&out),
+            [
+                ("a".to_string(), Some("styles".to_string())),
+                ("active".to_string(), Some("styles".to_string())),
+                ("card".to_string(), Some("styles".to_string())),
+                ("g".to_string(), None),
+                ("lit".to_string(), Some("styles".to_string())),
+                ("o".to_string(), Some("other".to_string())),
+                ("plain".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_call_of_a_name_that_was_not_bound_to_a_class_helper_is_no_class_position() {
+        let out = run(
+            "src/A.tsx",
+            "import styles from './a.module.css';\nconst cx = makeIt(styles);\nconst y = cx('card');\nfunction f(cx) { return cx('x'); }\n",
+        );
+
+        assert!(classes(&out).is_empty());
+    }
+
+    /// The class refs of a file as sorted (token, line, owner name).
+    fn placed(out: &Extract) -> Vec<(String, usize, String)> {
+        let mut found: Vec<(String, usize, String)> = out
+            .refs
+            .iter()
+            .filter(|r| r.kind == "cls")
+            .map(|r| {
+                let owner = r
+                    .from
+                    .and_then(|from| out.syms.get(from))
+                    .map_or("", |sym| sym.name.as_str());
+
+                (r.name.clone(), r.line, owner.to_string())
+            })
+            .collect();
+
+        found.sort();
+
+        found
+    }
+
+    #[test]
+    fn class_list_calls_name_their_classes_on_any_receiver() {
+        let out = run(
+            "src/a.ts",
+            "el.classList.add('a', 'b c', x);\nthis.node.classList.remove('d');\ndoc?.body.classList.toggle('e', 'not-this');\n\
+             if (el.classList.contains('f', 'nor-this')) {}\nel.classList.replace('g', 'h', 'nor-this');\n\
+             classList.add('free');\nel.add('plain');\nlist.classList.item('item');\n",
+        );
+
+        assert_eq!(tokens(&out), ["a", "b", "c", "d", "e", "f", "g", "h"]);
+    }
+
+    #[test]
+    fn a_class_name_assignment_reads_its_right_side() {
+        let out = run(
+            "src/a.ts",
+            "el.className = 'a b';\nel.className += ' c';\nel.className = ok ? 'd' : 'e';\nel.id = 'no';\nel.className = cn('f');\nel.classNames = 'g';\n",
+        );
+
+        assert_eq!(tokens(&out), ["a", "b", "c", "d", "e", "f"]);
+    }
+
+    #[test]
+    fn a_selector_a_query_method_reads_gives_its_class_tokens_and_not_those_it_excludes() {
+        let out = run(
+            "src/a.ts",
+            "document.querySelector('.a > .b:not(.c)');\nel.querySelectorAll(`.d [data-x=\".no\"]`);\nel.closest('.e, #f');\n\
+             el.matches('.g');\nel.getElementsByClassName('h i');\nfoo('.nope');\nel.querySelector(`.p-${x}`);\n\
+             matches('.free');\nel.querySelector(ok ? '.j' : '.k');\nel.on('.l');\n",
+        );
+
+        assert_eq!(tokens(&out), ["a", "b", "d", "e", "g", "h", "i", "j", "k"]);
+    }
+
+    #[test]
+    fn a_line_of_a_selector_is_the_line_its_class_is_on() {
+        let out = run("src/a.ts", "x;\nel.querySelector(`\n  .a\n  .b`);\n");
+
+        assert_eq!(
+            placed(&out),
+            vec![("a".to_string(), 3, String::new()), ("b".to_string(), 4, String::new())]
+        );
+    }
+
+    #[test]
+    fn an_attribute_or_key_ending_in_class_name_holds_classes_and_the_other_style_props_do_not() {
+        let out = run(
+            "src/A.tsx",
+            "export const A = () => <W wrapperClassName=\"a\" iconClassName={cn('b')} classes=\"no\" sx=\"no2\" style=\"no3\" ClassName=\"no4\" />;\n\
+             const o = { labelClassName: 'c', 'inputClassName': 'd', classes: 'no5', sx: 'no6', style: 'no7' };\n",
+        );
+
+        assert_eq!(tokens(&out), ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn a_constant_read_in_a_class_position_gives_its_classes_at_the_use() {
+        let out = run(
+            "src/A.tsx",
+            "const base = 'card box';\nconst mode = on ? 'x' : 'y';\nconst list = ['l1', `l2`];\nconst help = cn('h1', { h2: a });\n\
+             const never = 'unused';\nconst twice = base;\nconst deep = twice;\n\
+             export function A() {\n  const local = 'loc';\n  return <div className={base}>\n    <p className={cn(mode, 'z', list)} class={deep} id={help} title={local} />\n    <b className={local} />\n  </div>;\n}\n",
+        );
+
+        // `help` is a helper call at its declaration: that read is the older one, at the declaration, and `id` is
+        // no class position
+        assert_eq!(
+            placed(&out),
+            vec![
+                ("box".to_string(), 10, "A".to_string()),
+                ("card".to_string(), 10, "A".to_string()),
+                ("h1".to_string(), 4, "help".to_string()),
+                ("h2".to_string(), 4, "help".to_string()),
+                ("l1".to_string(), 11, "A".to_string()),
+                ("l2".to_string(), 11, "A".to_string()),
+                ("loc".to_string(), 12, "A".to_string()),
+                ("x".to_string(), 11, "A".to_string()),
+                ("y".to_string(), 11, "A".to_string()),
+                ("z".to_string(), 11, "A".to_string()),
+            ]
+        );
+        assert!(!tokens(&out).contains(&"unused".to_string()));
+    }
+
+    #[test]
+    fn a_constant_is_followed_in_the_other_class_sources_too() {
+        let out = run(
+            "src/a.ts",
+            "const c1 = 'a'; const sel = '.b'; const c2 = ['c'];\nel.classList.add(c1);\nel.className = c2;\nel.querySelector(sel);\nel.closest(`${sel}`);\n\
+             const p = <W iconClassName={c1} />;\n",
+        );
+
+        assert_eq!(tokens(&out), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_constant_that_is_not_surely_one_is_not_followed() {
+        let out = run(
+            "src/A.tsx",
+            "import { imp } from './x';\nlet lv = 'a'; lv = 'a2'; var vv = 'b'; const { dd } = obj; const o = { k: 'c' };\nconst shadowed = 'd';\n\
+             const t = 'ok-top';\n\
+             export function A(param = 'e', { destructured }, shadowed) {\n  const { t: inner } = obj;\n  return <p className={cn(lv, vv, dd, imp, param, destructured, o.k, shadowed, unknown)} />;\n}\n\
+             function B() { let shadowed = 'f'; return <p className={shadowed} />; }\n\
+             function C() { const shadowed = 'g'; return <p className={shadowed} />; }\n\
+             function D() { return <p className={shadowed} />; }\n\
+             function E() { { const blocked = 'h'; } return <p className={blocked} />; }\n\
+             function F(t) { return <p className={t} />; }\n\
+             function G() { for (const t of []) { return <p className={t} />; } }\n\
+             function H() { try {} catch (t) { return <p className={t} />; } }\n",
+        );
+
+        assert_eq!(tokens(&out), ["d", "g"]);
+    }
+
+    #[test]
+    fn a_constant_of_one_function_is_no_name_of_another_and_a_later_top_level_one_still_reads() {
+        let out = run(
+            "src/A.tsx",
+            "function A() { const mine = 'a'; return <p className={mine} />; }\nfunction B() { return <p className={mine} />; }\n\
+             function C() { return <p className={late} />; }\nconst late = 'c';\n",
+        );
+
+        assert_eq!(
+            placed(&out),
+            vec![
+                ("a".to_string(), 1, "A".to_string()),
+                ("c".to_string(), 3, "C".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_constant_named_for_a_credential_is_not_followed() {
+        let out = run(
+            "src/A.tsx",
+            "const dbPassword = 'hidden'; const ok = 'shown';\nconst a = <p className={dbPassword} /> ; const b = <p className={ok} />;\n",
+        );
+
+        assert_eq!(tokens(&out), ["shown"]);
+    }
+
+    #[test]
+    fn chains_of_constants_stop_at_the_limit_and_a_cycle_ends() {
+        let out = run(
+            "src/a.ts",
+            "const a = b; const b = a;\nel.className = a;\nconst c1 = 'ok1'; const c2 = c1; const c3 = c2; const c4 = c3; const c5 = c4; const c6 = c5;\n\
+             el.className = c4;\nel.className = c6;\n",
+        );
+
+        assert_eq!(tokens(&out), ["ok1"]);
+        assert!(out.classes_cut);
+    }
+
+    #[test]
+    fn hostile_constants_are_read_within_their_budgets() {
+        let count = 6_000;
+        let chain: String = (0..count).map(|i| format!("const c{} = c{};\n", i + 1, i)).collect();
+        let big = format!("const big = [{}];\n", "'tok', ".repeat(40_000));
+        let uses = "el.className = big;\n".repeat(5_000);
+        let wide = format!(
+            "const w0 = ['x'];\n{}el.className = w6;\n",
+            (1..=6)
+                .map(|i| format!("const w{i} = [{}];\n", format!("w{}, ", i - 1).repeat(200)))
+                .collect::<String>()
+        );
+        let deep = format!(
+            "const d = {}'z'{};\nel.className = d;\n",
+            "[".repeat(20_000),
+            "]".repeat(20_000)
+        );
+
+        for source in [
+            format!("const c0 = 'a';\n{chain}el.className = c{count};\n"),
+            format!("{big}{uses}"),
+            wide,
+            deep,
+        ] {
+            let started = std::time::Instant::now();
+            let out = std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn(move || super::super::extract(&mut tree_sitter::Parser::new(), "a.ts", &source))
+                .expect("thread")
+                .join()
+                .expect("no stack overflow");
+
+            assert!(
+                started.elapsed() < super::super::FILE_LIMIT / 10,
+                "{:?}",
+                started.elapsed()
+            );
+            assert!(out.refs.iter().filter(|r| r.kind == "cls").count() <= 1_000);
+        }
+    }
+
     /// The `base` references of a file as (base, derived).
     fn bases(out: &Extract) -> Vec<(&str, &str)> {
         out.refs
@@ -1207,5 +1994,44 @@ mod tests {
         let js = run("ts/b.js", "class A extends B {}\nclass C extends ns.D {}\n");
 
         assert_eq!(bases(&js), [("B", "A"), ("D", "C")]);
+    }
+
+    #[test]
+    fn a_reference_inside_jsx_is_marked_as_written_in_markup_and_one_outside_it_is_not() {
+        let out = run(
+            "a.tsx",
+            "export function A() {\n  plain();\n  const x = <div />;\n  return <p onClick={() => { inner(); }}>{shown()}<Card /></p>;\n}\nafter();\n",
+        );
+        let marked = |name: &str| out.refs.iter().find(|r| r.name == name).map(|r| r.markup);
+
+        assert_eq!(marked("plain"), Some(false));
+        assert_eq!(marked("after"), Some(false));
+        assert_eq!(marked("shown"), Some(true));
+        assert_eq!(marked("inner"), Some(true));
+        assert_eq!(marked("Card"), Some(true));
+    }
+
+    #[test]
+    fn a_file_cut_off_deep_inside_a_call_is_read_in_linear_time() {
+        // the parser keeps what it cannot read as one flat node of thousands of children; asking each child for
+        // its parent made the walk quadratic (23 s for 200 KB). The shapes make a one-letter string, a word, a
+        // name of a command, a constant and an object literal, each one asking for a parent of its own
+        for unit in ["a?'b':", "a?'beta':", "a?'get_beta':", "FOO.BAR?'b':", "x=a?{k:v}:"] {
+            let mut src = String::from("clsx(");
+
+            while src.len() < 200_000 {
+                src.push_str(unit);
+            }
+
+            let started = std::time::Instant::now();
+            let out = run("a.ts", &src);
+
+            assert!(
+                started.elapsed() < super::super::FILE_LIMIT / 10,
+                "{unit} {:?}",
+                started.elapsed()
+            );
+            assert_eq!(out.dropped, 0, "{unit}");
+        }
     }
 }

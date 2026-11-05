@@ -254,7 +254,32 @@ fn run() -> Report {
 
     limits(&env, &request);
 
-    work(&env, &request).unwrap_or_else(report_of_error)
+    work_on_a_large_stack(&env, &request).unwrap_or_else(report_of_error)
+}
+
+/// The stack of the thread that reads the repository. The C parser of a language recurses once for each level a
+/// file nests (`{a:` a quarter of a million times fits in the size limit), and the 8 MiB of the main thread is
+/// gone long before: the worker died with "stack overflow" and the repository was answered "could not be indexed"
+/// for its healthy files too. The stack is virtual, so only the part a file touches is paid for; on Linux
+/// `RLIMIT_DATA` counts the mapping once (a small part of the 2 GiB, and of the 256 MiB the lowest setting leaves).
+const READING_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// [`work`] on a thread with [`READING_STACK_BYTES`] of stack. The limits are applied before (the signal mask the
+/// thread inherits is the one `limits` made, and the parent-death signal stays on the main thread, which the kernel
+/// looks at). A panic of the thread is the panic of the worker.
+fn work_on_a_large_stack(env: &Env, request: &Request) -> Result<Report, String> {
+    std::thread::scope(|scope| {
+        let reading = std::thread::Builder::new()
+            .name("code-reading".into())
+            .stack_size(READING_STACK_BYTES)
+            .spawn_scoped(scope, || work(env, request))
+            .map_err(|error| format!("cannot start the thread that reads the repository: {error}"))?;
+
+        match reading.join() {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
 }
 
 /// The report of a run that ended with `message`: the repository broke the worker when SQLite ran out of

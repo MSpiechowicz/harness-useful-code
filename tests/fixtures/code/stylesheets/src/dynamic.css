@@ -1,0 +1,31 @@
+.dyn-base {
+  color: red;
+}
+
+.dyn-toggle {
+  color: green;
+}
+
+.dyn-not-this {
+  color: gray;
+}
+
+.dyn-query .dyn-child {
+  color: blue;
+}
+
+.dyn-excluded {
+  color: black;
+}
+
+.dyn-wrap {
+  margin: 0;
+}
+
+.dyn-unused {
+  margin: 1px;
+}
+
+.dyn-shadow {
+  margin: 2px;
+}

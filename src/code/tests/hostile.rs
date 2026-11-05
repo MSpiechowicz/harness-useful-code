@@ -768,3 +768,267 @@ fn a_string_that_names_nothing_defined_is_stored_but_not_loaded_into_the_graph()
     // definition (the two other strings are left out)
     assert_eq!(named.counts().refs, 5);
 }
+
+/// A TSX component that writes the class tokens `t0 .. t{count}`, one to a line (a line of thousands of bytes
+/// marks a file as minified).
+fn component_with_classes(count: usize) -> String {
+    let tokens: Vec<String> = (0..count).map(|n| format!("t{n}")).collect();
+
+    format!(
+        "export function Page() {{ return <p className=\"{}\">x</p>; }}\n",
+        tokens.join("\n")
+    )
+}
+
+#[test]
+fn class_tokens_past_their_cap_are_cut_and_told_but_never_make_the_repository_too_large() {
+    let mut fixture = Fixture::new();
+
+    fixture.write("web/Page.tsx", &component_with_classes(1_000));
+    fixture.write("web/page.css", ".t0 { color: red; }\n.t999 { color: red; }\n");
+    fixture.index.caps = store::Caps {
+        refs: 20,
+        classes: 50,
+        ..store::Caps::default()
+    };
+
+    let root = fixture.root().to_path_buf();
+
+    assert!(fixture.index.graph(&root, &|| false).is_ok());
+    assert_eq!(rows(&fixture, "refs WHERE kind = 'cls'"), 50);
+    assert_eq!(rows(&fixture, "files WHERE class_cut = 1"), 1);
+
+    let first = fixture.symbol("web/page.css::.t0");
+    let last = fixture.symbol("web/page.css::.t999");
+
+    assert!(first.contains("web/Page.tsx:1 Page (class)"), "{first}");
+    assert!(
+        first.contains("class uses past the index caps were not read (1 files"),
+        "{first}"
+    );
+    assert!(
+        last.contains("used by 0 site(s)") && last.contains("class uses past the index caps were not read"),
+        "a use that was cut is told, not reported as run-time: {last}"
+    );
+
+    // a reference of the code still counts toward the cap
+    fixture.write(
+        "web/Page.tsx",
+        &format!("export function Page() {{ {} }}\n", "g();".repeat(30)),
+    );
+
+    assert_eq!(fixture.index.graph(&root, &|| false).err().as_deref(), Some(TOO_LARGE));
+}
+
+#[test]
+fn pages_left_out_by_the_page_cap_are_told_in_the_count_of_a_selector() {
+    let mut fixture = Fixture::new();
+
+    fixture.write("web/page.css", ".lead { color: red; }\n");
+
+    for n in 0..crate::code::walk::MAX_HTML_FILES {
+        fixture.write(&format!("docs/p{n:04}.html"), "<p class=\"lead\">x</p>\n");
+    }
+
+    let whole = fixture.symbol("web/page.css::.lead");
+
+    assert!(!whole.contains("class uses past the index caps"), "{whole}");
+
+    fixture.write("docs/p9999.html", "<p class=\"lead\">x</p>\n");
+    fixture.write("docs/p9998.html", "<p class=\"lead\">x</p>\n");
+
+    let cut = fixture.symbol("web/page.css::.lead");
+
+    assert!(
+        cut.contains("class uses past the index caps were not read (2 pages), so this count may be low"),
+        "{cut}"
+    );
+}
+
+#[test]
+fn a_token_on_two_hundred_selectors_keeps_its_own_rule_and_says_the_list_is_cut() {
+    let mut fixture = Fixture::new();
+    let mut sheet: String = (0..200).map(|n| format!(".p{n} .btn {{ color: red; }}\n")).collect();
+
+    sheet.push_str(".btn { color: blue; }\n");
+    fixture.write("web/btn.css", &sheet);
+    fixture.write(
+        "web/Button.tsx",
+        "export function Button() { return <button className=\"btn\">x</button>; }\n",
+    );
+
+    let exact = fixture.symbol("web/btn.css::.btn");
+    let past = fixture.symbol("web/btn.css::.p199 .btn");
+    let early = fixture.symbol("web/btn.css::.p0 .btn");
+
+    assert!(exact.contains("web/Button.tsx:1 Button (class)"), "{exact}");
+    assert!(
+        exact.contains("class `btn` is on 201 selectors; uses are linked to the first 64, so this count may be low"),
+        "{exact}"
+    );
+    assert!(early.contains("web/Button.tsx:1 Button (class)"), "{early}");
+    assert!(
+        past.contains("used by 0 site(s)") && past.contains("class `btn` is on 201 selectors"),
+        "{past}"
+    );
+}
+
+#[test]
+fn thousands_of_class_uses_leave_the_edges_of_the_code_as_they_were() {
+    let sites = |classes: bool| {
+        let mut fixture = Fixture::new();
+
+        fixture.write(
+            "web/lib.ts",
+            "export function helper() { return 1; }\nexport function again() { return helper(); }\n",
+        );
+        fixture.write(
+            "web/use.ts",
+            "import { helper } from './lib';\nexport function run() { return helper(); }\n",
+        );
+
+        if classes {
+            let sheet: String = (0..3_000).map(|n| format!(".t{n} .u{n} {{ color: red; }}\n")).collect();
+
+            fixture.write("web/many.css", &sheet);
+
+            for part in 0..3 {
+                let tokens: Vec<String> = (0..1_000).map(|n| format!("t{}", part * 1_000 + n)).collect();
+
+                fixture.write(
+                    &format!("web/Page{part}.tsx"),
+                    &format!(
+                        "export function Page{part}() {{ return <p className=\"{}\">x</p>; }}\n",
+                        tokens.join("\n")
+                    ),
+                );
+            }
+        }
+
+        if classes {
+            assert!(
+                fixture.symbol("web/many.css::.t2005 .u2005").contains("Page2 (class)"),
+                "the class links are made"
+            );
+        }
+
+        let answer = fixture.symbol("web/lib.ts::helper");
+
+        answer
+            .lines()
+            .filter(|line| line.contains("web/"))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(sites(true), sites(false));
+}
+
+/// Components that each import one stylesheet hub of `imports` imports (none of them exists), and write a
+/// class the stylesheet next to it styles: the lookups of the hub are the work of the class pass.
+fn hub_fixture(files: usize, imports: usize) -> Fixture {
+    let fixture = Fixture::new();
+    let hub: String = (0..imports).map(|n| format!("@import \"./m{n}\";\n")).collect();
+
+    fixture.write("src/hub.scss", &hub);
+    fixture.write("src/x.css", ".x { top: 0; }\n");
+
+    for n in 0..files {
+        fixture.write(
+            &format!("src/p{n}.tsx"),
+            &format!("import './hub.scss';\nexport const c{n} = () => <div className=\"x\" />;\n"),
+        );
+    }
+
+    fixture
+}
+
+/// A cancellation check that is slow, so that the time a stage takes follows the number of times it asks and
+/// not how fast the machine is.
+fn slow_stop() -> bool {
+    std::thread::sleep(Duration::from_millis(2));
+
+    false
+}
+
+#[test]
+fn a_class_pass_that_runs_out_of_its_time_does_not_fail_the_index_that_the_worker_validates() {
+    let mut fixture = hub_fixture(60, 20_000);
+    let root = fixture.root().to_path_buf();
+
+    // the stylesheet lookups alone ask the pace about thirteen hundred times, which is longer than the budget
+    fixture.index.set_budget(Duration::from_secs(2));
+
+    let (_, _, counts) = fixture
+        .index
+        .validate(&root, &slow_stop, &mut crate::code::builds::NoObserver, &|| {})
+        .expect("a class pass out of time is no reason to fail the index");
+
+    assert_eq!(counts.files, 61 + 1);
+
+    // the same load and trial on one pace, as the worker runs them: the uses are counted as unread
+    let key = root.to_str().expect("utf-8").to_owned();
+    let repo = fixture.index.store.known(&key).expect("known").expect("repo").repo;
+    let pace = Pace::new(&slow_stop, Duration::from_secs(2));
+    let answer = fixture
+        .index
+        .store
+        .snapshot(|conn| {
+            let graph = Graph::load(conn, repo, &pace)?;
+
+            graph.trial(&pace)?;
+
+            Ok(graph.symbol(".x", 20))
+        })
+        .expect("load and trial");
+
+    assert!(
+        answer.contains("class uses past the index caps were not read"),
+        "{answer}"
+    );
+}
+
+/// One stylesheet that `hubs` hubs import by way of `dups` spellings of one folder that holds sixteen sheets.
+fn fan_fixture(files: usize, hubs: usize, dups: usize) -> Fixture {
+    let fixture = Fixture::new();
+
+    for ext in ["scss", "sass", "css", "less"] {
+        for p in ["y", "_y", "y/_index", "y/index"] {
+            fixture.write(&format!("src/{p}.{ext}"), "");
+        }
+    }
+
+    for h in 0..hubs {
+        let text: String = (0..dups).map(|i| format!("@import \"./y?{i}\";\n")).collect();
+
+        fixture.write(&format!("src/h{h}.scss"), &text);
+    }
+
+    let hub_imports: String = (0..hubs).map(|h| format!("@import \"./h{h}.scss\";\n")).collect();
+
+    fixture.write("src/m.scss", &format!(".x {{ top: 0; }}\n{hub_imports}"));
+
+    for i in 0..files {
+        fixture.write(
+            &format!("src/p{i}.tsx"),
+            &format!("import './m.scss';\nexport const c{i} = () => <div className=\"x\"/>;\n"),
+        );
+    }
+
+    fixture
+}
+
+#[test]
+fn imports_that_resolve_to_the_same_sixteen_sheets_are_walked_once_not_once_per_spelling() {
+    let fixture = fan_fixture(2_000, 40, 400);
+    let root = fixture.root().to_path_buf();
+    let started = Instant::now();
+
+    fixture
+        .index
+        .validate(&root, &|| false, &mut crate::code::builds::NoObserver, &|| {})
+        .expect("validate");
+
+    // without the duplicates removed, every use walked sixteen sheets for each of sixteen thousand spellings
+    assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
+}

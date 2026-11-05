@@ -1,0 +1,222 @@
+# every template kind writes `tile`; no stylesheet that a writer imports holds it, so the uses reach the one
+# sheet by name (`?`)
+[[symbol]]
+query = "src/sass/app.sass::.tile"
+note = "html:3 body class, Box.svelte:5 class=, Card.tsx:13 clsx object key, Hero.astro:5 class=, Widget.vue:6 class="
+defined = "src/sass/app.sass:36"
+used_by = [
+  "public/index.html:3 <module>",
+  "src/Box.svelte:5 Box",
+  "src/Card.tsx:13 Card",
+  "src/Hero.astro:5 Hero",
+  "src/Widget.vue:6 Widget",
+]
+uses = ["$brand"]
+
+[[symbol]]
+query = "src/sass/app.sass::.chip"
+note = "html:4 (with a {{ }} hole), Svelte class= with a ternary, Astro class={}, Vue :class object"
+used_by = ["public/index.html:4", "src/Box.svelte:5", "src/Hero.astro:6", "src/Widget.vue:7"]
+not_used_by = ["src/Card.tsx"]
+
+[[symbol]]
+query = "src/sass/app.sass::.pill"
+note = "Svelte class:pill={on}, Astro class={} branch, Vue :class object"
+used_by = ["src/Box.svelte:6", "src/Hero.astro:6", "src/Widget.vue:7"]
+
+[[symbol]]
+query = "src/sass/app.sass::.flag"
+note = "Svelte class:flag shorthand, Astro class= with a static part and a hole"
+used_by = ["src/Box.svelte:6", "src/Hero.astro:7"]
+
+[[symbol]]
+query = "src/sass/app.sass::.dot"
+note = "Svelte class={} ternary, Astro class= hole, Vue v-bind:class array"
+used_by = ["src/Box.svelte:7", "src/Hero.astro:7", "src/Widget.vue:8"]
+
+[[symbol]]
+query = "src/sass/app.sass::.ring"
+note = "Astro class= hole and Vue v-bind:class array"
+used_by = ["src/Hero.astro:7", "src/Widget.vue:8"]
+
+[[symbol]]
+query = "src/sass/app.sass::.halo"
+note = "only Astro class:list={[.., { halo: on }]} writes it"
+used_by = ["src/Hero.astro:8 Hero"]
+not_used_by = ["src/Widget.vue", "src/Box.svelte"]
+
+# a use goes to the nearest stylesheet that holds the token: Card.tsx imports card.css, so app.sass's `.card`
+# is not reached and says why it reads zero
+[[symbol]]
+query = "src/card.css::.card"
+note = "Card.tsx:12 cn('card', ..) after import './card.css'"
+used_by = ["src/Card.tsx:12 Card"]
+not_used_by = ["src/Panel.tsx"]
+
+[[symbol]]
+query = "src/card.css::.card--on"
+note = "Card.tsx:12 cn(.., on && 'card--on')"
+used_by = ["src/Card.tsx:12"]
+
+[[symbol]]
+query = "src/card.css::.badge--warm"
+note = "Card.tsx:6 cva variant value; the variant name `warm` and `tone` are no classes"
+used_by = ["src/Card.tsx:6"]
+
+[[symbol]]
+query = "src/card.css::.note"
+note = "Card.tsx:9 holds the string 'note' in a title attribute, which is no class position"
+not_used_by = ["src/Card.tsx"]
+
+[[symbol]]
+query = "src/sass/app.sass::.card"
+note = "Card.tsx writes `card`, but its imported card.css wins the token"
+not_used_by = ["src/Card.tsx", "src/Panel.tsx"]
+uses = ["%base", "box", "$gap", "spin", "fade", "double"]
+not_uses = ["ease-in", "infinite"]
+
+[[symbol]]
+query = "src/sass/app.sass::.card--on"
+note = "&--on at line 25"
+defined = "src/sass/app.sass:25"
+
+[[symbol]]
+query = "src/sass/app.sass::.card .spacer"
+note = "a leaf rule without a declaration is an empty rule at its own line (the compiler drops it)"
+defined = "src/sass/app.sass:30"
+
+[[symbol]]
+query = "src/sass/app.sass::%base"
+note = "@extend %base at line 22"
+used_by = ["src/sass/app.sass:22 .card"]
+
+# `styles.card` reaches the module Panel.tsx imports and nothing else
+[[symbol]]
+query = "src/Panel.module.css::.card"
+note = "Panel.tsx:5 styles.card"
+used_by = ["src/Panel.tsx:5 Panel"]
+not_used_by = ["src/Card.tsx"]
+
+[[symbol]]
+query = "src/Panel.module.css::.body"
+note = "Panel.tsx:6 styles.body"
+used_by = ["src/Panel.tsx:6 Panel"]
+
+[[symbol]]
+query = "src/legacy/card.css::.card"
+note = "a same-named class elsewhere: neither Panel.tsx (styles.card) nor Card.tsx (imports card.css) reaches it"
+not_used_by = ["src/Panel.tsx", "src/Card.tsx"]
+
+[[symbol]]
+query = "src/Widget.vue::.local"
+note = "$style.local at Widget.vue:9, reads the file's own block"
+used_by = ["src/Widget.vue:9 Widget"]
+
+# animation names reach @keyframes in a .sass file
+[[symbol]]
+query = "spin"
+note = "app.sass:24 animation: spin 1s ease-in infinite, fade .2s"
+defined = "src/sass/app.sass:9"
+used_by = ["src/sass/app.sass:24 .card"]
+
+[[symbol]]
+query = "fade"
+used_by = ["src/sass/app.sass:24 .card"]
+
+# a token read in the style block of a component reaches the .sass tokens
+[[symbol]]
+query = "$gap"
+note = "t.$gap in Widget.vue's scss block, Hero.astro's sass block and app.sass"
+defined = "src/tokens/_tokens.sass:2"
+used_by = ["src/Hero.astro:15 section", "src/Widget.vue:17 .wrapper", "src/sass/app.sass:23 .card"]
+
+[[symbol]]
+query = "@gap"
+note = "Less variable theme.less:1, read at line 11"
+defined = "src/less/theme.less:1"
+used_by = ["src/less/theme.less:11 .theme"]
+
+[[symbol]]
+query = "src/less/theme.less::.theme"
+note = "index.html:5 class, theme.less:15 &:extend"
+used_by = ["public/index.html:5 <module>", "src/less/theme.less:15 .theme-dark"]
+uses = [".rounded", "@accent", "@gap"]
+
+# a file `.gitattributes` marks `linguist-generated` is left out and says so
+[[symbol]]
+query = "generated/bundle.css"
+note = "generated/.gitattributes: *.css linguist-generated"
+
+[[impact]]
+query = "generated/bundle.css"
+note = "the left-out answer, not an empty list"
+contains = ["is marked generated by `.gitattributes` and is not in the index"]
+
+# a change to a token reaches the components through the selector that reads it
+[[impact]]
+query = "$brand"
+depth = 3
+note = "$brand <- .tile (app.sass:37) <- every file that writes `tile`"
+files = ["src/sass/app.sass", "src/Card.tsx", "src/Box.svelte", "src/Hero.astro", "src/Widget.vue", "public/index.html"]
+contains = ["Card → .tile"]
+
+[[map]]
+note = "the stylesheets of every kind are named; the generated one is not"
+files = [
+  "src/sass/app.sass",
+  "src/tokens/_tokens.sass",
+  "src/less/theme.less",
+  "src/card.css",
+  "src/Panel.module.css",
+]
+not_files = ["generated/bundle.css"]
+
+# two components that write the same class are no way to each other
+[[path]]
+from = "Card"
+to = "Widget"
+note = "both write `tile`; a selector is no way between two components"
+text_only = true
+contains = ["no chain within 6 hops", "got as far as Card → badge"]
+not_contains = [".tile"]
+
+# a class written through `classList`, `querySelector`, a `*ClassName` prop and a same-file constant
+[[symbol]]
+query = "src/dynamic.css::.dyn-base"
+note = "Dynamic.tsx:13 className={base} with const base at line 3: linked at the use, by the component"
+used_by = ["src/Dynamic.tsx:13 Dynamic"]
+
+[[symbol]]
+query = "src/dynamic.css::.dyn-toggle"
+note = "Dynamic.tsx:10 classList.toggle('dyn-toggle', ..): the first argument only"
+used_by = ["src/Dynamic.tsx:10 Dynamic"]
+
+[[symbol]]
+query = "src/dynamic.css::.dyn-not-this"
+note = "the second argument of toggle is a flag"
+not_used_by = ["src/Dynamic.tsx"]
+
+[[symbol]]
+query = "src/dynamic.css::.dyn-query .dyn-child"
+note = "Dynamic.tsx:11 querySelector('.dyn-query > .dyn-child:not(..)')"
+used_by = ["src/Dynamic.tsx:11 Dynamic"]
+
+[[symbol]]
+query = "src/dynamic.css::.dyn-excluded"
+note = "named inside :not(..) in the selector: excluded, not written"
+not_used_by = ["src/Dynamic.tsx"]
+
+[[symbol]]
+query = "src/dynamic.css::.dyn-wrap"
+note = "Dynamic.tsx:13 wrapperClassName"
+used_by = ["src/Dynamic.tsx:13 Dynamic"]
+
+[[symbol]]
+query = "src/dynamic.css::.dyn-unused"
+note = "a constant never put in a class position links nothing"
+not_used_by = ["src/Dynamic.tsx"]
+
+[[symbol]]
+query = "src/dynamic.css::.dyn-shadow"
+note = "the parameter `shadow` hides the top-level constant at its use"
+not_used_by = ["src/Dynamic.tsx"]

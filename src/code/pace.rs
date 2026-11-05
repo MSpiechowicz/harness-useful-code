@@ -40,6 +40,18 @@ impl<'a> Pace<'a> {
         Ok(())
     }
 
+    /// A pace for one stage that may spend at most `1 / parts` of what is left now, under the same
+    /// cancellation. A stage that can be given up on (the class links) takes this, so running out of its
+    /// own time leaves the rest of the call the time it needs, instead of failing it.
+    pub fn share(&self, parts: u32) -> Pace<'a> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+
+        Pace {
+            stop: self.stop,
+            deadline: Instant::now() + left / parts.max(1),
+        }
+    }
+
     /// The caller's cancellation alone.
     pub fn stop(&self) -> &'a dyn Fn() -> bool {
         self.stop

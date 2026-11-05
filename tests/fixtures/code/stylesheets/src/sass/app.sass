@@ -1,0 +1,55 @@
+@use "../tokens/tokens" as t
+
+// the base look every block shares
+/* the animations
+   used by the cards */
+%base
+  display: block
+
+@keyframes spin
+  from
+    transform: rotate(0deg)
+  to
+    transform: rotate(360deg)
+
+@keyframes fade
+  from
+    opacity: 0
+  to
+    opacity: 1
+
+.card
+  @extend %base
+  +t.box(t.$gap)
+  animation: spin 1s ease-in infinite, fade .2s
+  &--on
+    color: red
+  .title,
+  .subtitle
+    font-size: t.double(8px)
+  .spacer
+  @if t.$gap > 4px
+    border: 1px solid
+  @else
+    border: 0
+
+.tile
+  color: t.$brand
+
+.chip
+  color: green
+
+.pill
+  color: orange
+
+.flag
+  color: purple
+
+.dot
+  color: gray
+
+.ring
+  color: teal
+
+.halo
+  color: gold

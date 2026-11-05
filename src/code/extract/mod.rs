@@ -15,10 +15,15 @@ use std::time::{Duration, Instant};
 
 use tree_sitter::{Language, Node, ParseOptions, Parser, Tree};
 
+mod classes;
 mod go;
+mod html;
+mod less;
 mod literals;
+mod markup;
 mod python;
 mod rust;
+mod sass;
 mod scss;
 mod sfc;
 mod sfc_template;
@@ -105,6 +110,9 @@ pub struct Sym {
     pub ret: Option<String>,
     /// Inside `#[cfg(test)]` / `#[test]`.
     pub test: bool,
+    /// Written in the `<style>` block of a component: a stylesheet definition inside a file of another
+    /// language.
+    pub style: bool,
 }
 
 /// A reference to a name.
@@ -117,7 +125,9 @@ pub struct Ref {
     /// `fnref` (a function passed as a value), `prop` (a function kept in a property of an object literal:
     /// `name` is the property, `qual` the value as written, `recv` the function the literal is passed to),
     /// `base` (a type derives from or implements another: `name` is the base, `qual` the derived type, see
-    /// [`push_base`]) or `word` (a short plain-word string literal inside a definition, see [`word_like`]).
+    /// [`push_base`]), `cls` (a class token written in code: `name` is the token, `qual` the stylesheet module of
+    /// `styles.card` as written, see [`Extract::add_class`]) or `word` (a short plain-word string literal inside a
+    /// definition, see [`word_like`]).
     pub kind: &'static str,
     /// `git` in `git::diff()`, `Env` in `Env::new()`, `Foo` in `Foo.bar()`.
     pub qual: Option<String>,
@@ -128,6 +138,12 @@ pub struct Ref {
     /// handled: a `case` label, an operand of an equality test or the pattern of an `if let` (see [`handled`]).
     /// False for everything else.
     pub handler: bool,
+    /// Written in the `<style>` block of a component (see [`Sym::style`]).
+    pub style: bool,
+    /// Written in the markup of a page or a component (a template, JSX), where the line of source holds the
+    /// text of a page next to the code: the graph gives the place of such a reference and never the line.
+    /// Set by [`Extract::add_ref`] while [`Extract::in_markup`] holds.
+    pub markup: bool,
 }
 
 /// A name brought into a file.
@@ -161,8 +177,22 @@ pub struct Extract {
     pub binds: Vec<Bind>,
     /// Entries left out because the file went past the per-file caps.
     pub dropped: usize,
+    /// Class tokens were left out because the file went past its cap: the store marks the file, so a count of
+    /// users can say it may be low.
+    pub classes_cut: bool,
+    /// Stylesheet selectors were left out because the file went past its caps (the symbols, the names a nested
+    /// rule may build): the store marks the file, so an answer about it can say it may be incomplete.
+    pub selectors_cut: bool,
+    /// The names of nested stylesheet selectors worked out so far, over every style block of the file.
+    names_worked: usize,
     /// How many `word` references the file holds (they have a cap of their own).
     words: usize,
+    /// A reference added now is written in markup (see [`Ref::markup`]). The readers of a template and of JSX set
+    /// it around the nodes they walk, so no reference has to say it and none can forget to.
+    pub(super) in_markup: bool,
+    /// The class tokens kept, as (owner, token, qualifier): a token written again is kept once, and the count is
+    /// the file's share of [`classes::MAX_CLASS_TOKENS_PER_FILE`].
+    class_seen: std::collections::HashSet<(Option<usize>, String, Option<String>)>,
 }
 
 impl Extract {
@@ -214,9 +244,64 @@ impl Extract {
             return;
         }
 
+        reference.markup |= self.in_markup;
+
         // the receiver only speeds the resolution up: without it the reference is still a call
         reference.recv = reference.recv.filter(|recv| fits(recv));
         self.refs.push(reference);
+    }
+
+    /// Keeps the class token `token` written in the definition `from` (`qual` is the stylesheet module of
+    /// `styles.card`, as written) as a `cls` reference. A word that is no token and one that holds a credential
+    /// are not kept; the name of the definition it is written in does not matter (a component named `AuthLayout`
+    /// keeps its class links, and the token is checked on its own text); a token written again is kept once; past
+    /// [`classes::MAX_CLASS_TOKENS_PER_FILE`] the rest is left out and the file is marked ([`Extract::classes_cut`]).
+    pub(super) fn add_class(&mut self, from: Option<usize>, token: &str, qual: Option<&str>, line: usize) {
+        if !classes::is_token(token) || crate::support::redact::has_credentials_in_name(token) {
+            return;
+        }
+
+        // the definition was left out, and the class with it: the file says so, as for the other caps
+        if from == Some(DROPPED) {
+            self.dropped += 1;
+            self.classes_cut = true;
+
+            return;
+        }
+
+        let key = (from, token.to_string(), qual.map(str::to_string));
+
+        if self.class_seen.contains(&key) {
+            return;
+        }
+
+        if self.class_seen.len() >= classes::MAX_CLASS_TOKENS_PER_FILE {
+            self.classes_cut = true;
+
+            return;
+        }
+
+        let before = self.refs.len();
+
+        self.add_ref(Ref {
+            from,
+            name: key.1.clone(),
+            kind: "cls",
+            qual: key.2.clone(),
+            recv: None,
+            line,
+            handler: false,
+            style: false,
+            markup: false,
+        });
+
+        // a token the file's caps refused is not remembered, and it is not counted as a token; the file says so,
+        // as it does for the token cap
+        if self.refs.len() > before {
+            self.class_seen.insert(key);
+        } else {
+            self.classes_cut = true;
+        }
     }
 
     /// Keeps the import `import`; counts it instead when the file already holds [`MAX_IMPORTS_PER_FILE`] or
@@ -250,6 +335,12 @@ impl Extract {
         let before = self.syms.len() + self.refs.len() + self.imports.len() + self.binds.len();
 
         self.imports.retain(import_fits);
+
+        // a class use that bypassed `add_ref` and sits past the cap is cut with the rest
+        if self.refs.iter().skip(MAX_REFS_PER_FILE).any(|r| r.kind == "cls") {
+            self.classes_cut = true;
+        }
+
         self.syms.truncate(MAX_SYMS_PER_FILE);
         self.refs.truncate(MAX_REFS_PER_FILE);
         self.imports.truncate(MAX_IMPORTS_PER_FILE);
@@ -305,6 +396,12 @@ pub static LANGS: &[LangSpec] = &[
         exts: &["svelte", "vue", "astro"],
         run: sfc::extract,
     },
+    // a page is no code: only its style blocks (and, later, the classes it uses) are read
+    LangSpec {
+        name: "html",
+        exts: &["html"],
+        run: html::extract,
+    },
     LangSpec {
         name: "go",
         exts: &["go"],
@@ -319,6 +416,17 @@ pub static LANGS: &[LangSpec] = &[
         name: "scss",
         exts: &["scss", "css"],
         run: scss::extract,
+    },
+    // indented Sass and Less are read as stylesheets: the graph applies its SCSS rules to them
+    LangSpec {
+        name: "scss",
+        exts: &["sass"],
+        run: sass::extract,
+    },
+    LangSpec {
+        name: "scss",
+        exts: &["less"],
+        run: less::extract,
     },
 ];
 
@@ -348,14 +456,23 @@ pub fn extract_within(parser: &mut Parser, path: &str, src: &str, deadline: Inst
 
         // a string written in a definition's first line (`const KEY = "..."`, a default, a one-line body) is
         // not kept
-        for sym in &mut out.syms {
-            if let Cow::Owned(elided) = literals::elide_strings(&sym.sig, spec.name) {
-                sym.sig = elided;
-            }
-        }
+        elide_signatures(&mut out, spec.name);
     }
 
     out
+}
+
+/// Blanks the strings of every signature in `out`, reading them as `lang`. A definition from a style block is
+/// read as a stylesheet, whatever the file around it is: under the rules of TypeScript a string in a type
+/// position stays, so `$api-key: "abc"` would be stored as written.
+fn elide_signatures(out: &mut Extract, lang: &str) {
+    for sym in &mut out.syms {
+        let lang = if sym.style { "scss" } else { lang };
+
+        if let Cow::Owned(elided) = literals::elide_strings(&sym.sig, lang) {
+            sym.sig = elided;
+        }
+    }
 }
 
 /// `line`, a line of source in the language `lang` (a `files.lang` name), with the content of its string
@@ -404,7 +521,12 @@ pub(super) fn text<'a>(node: Node, src: &'a [u8]) -> &'a str {
 
 /// The first line of a node, trimmed, without a trailing `{`, shortened to 140 characters.
 pub(super) fn first_line(node: Node, src: &[u8]) -> String {
-    let line = text(node, src).lines().next().unwrap_or("").trim();
+    shorten(text(node, src).lines().next().unwrap_or(""))
+}
+
+/// `line` trimmed, without a trailing `{`, and at most 140 characters.
+pub(super) fn shorten(line: &str) -> String {
+    let line = line.trim();
     let line = line.trim_end_matches('{').trim_end();
 
     // at most 140 characters, and at most MAX_STR bytes (a line of wide characters, or no line break in a
@@ -488,6 +610,63 @@ pub(super) fn credential_named(name: &str) -> bool {
     CREDENTIAL_PARTS.iter().any(|part| lower.contains(part))
 }
 
+/// Words that mean a name holds a secret, as a value is written after it (`$api_key: x`, `password = x`), and
+/// the pairs of words that do (`api` and `key`). Narrower than [`CREDENTIAL_PARTS`], which is matched anywhere in
+/// a name and so finds `key` in `Keyboard` and `auth` in `Author`.
+const SECRET_WORDS: [&str; 10] = [
+    "password",
+    "passwd",
+    "pass",
+    "pwd",
+    "secret",
+    "credential",
+    "apikey",
+    "bearer",
+    "passwords",
+    "secrets",
+];
+const SECRET_PAIRS: [(&str, &str); 6] = [
+    ("api", "key"),
+    ("private", "key"),
+    ("access", "key"),
+    ("auth", "token"),
+    ("access", "token"),
+    ("refresh", "token"),
+];
+
+/// True when `name` really means a secret: one of [`SECRET_WORDS`], or two of [`SECRET_PAIRS`] side by side,
+/// as words (split at anything that is no letter or digit, and at a small letter before a capital:
+/// `$db-pass`, `--auth-token`, `apiKey`). `--ds-token-color`, `$passive`, `$compass` and `authCard` do not.
+pub(super) fn means_secret(name: &str) -> bool {
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut before: Option<char> = None;
+
+    for character in name.chars().take(BINDING_NAME_BYTES) {
+        let capital_after_small = character.is_ascii_uppercase() && before.is_some_and(|b| b.is_ascii_lowercase());
+
+        if (!character.is_ascii_alphanumeric() || capital_after_small) && !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+
+        if character.is_ascii_alphanumeric() {
+            word.push(character.to_ascii_lowercase());
+        }
+
+        before = Some(character);
+    }
+
+    if !word.is_empty() {
+        words.push(word);
+    }
+
+    words.iter().any(|word| SECRET_WORDS.contains(&word.as_str()))
+        || words.windows(2).any(|pair| match pair {
+            [first, second] => SECRET_PAIRS.contains(&(first.as_str(), second.as_str())),
+            _ => false,
+        })
+}
+
 /// The fields of a node that hold the name a value is bound to (`const NAME = v`, `NAME = v`, `{ NAME: v }`,
 /// `let NAME = v`, `f(NAME=v)`).
 const BINDING_FIELDS: [&str; 5] = ["name", "left", "key", "pattern", "field"];
@@ -500,10 +679,17 @@ const BINDING_NAME_BYTES: usize = 120;
 /// assignment, a member of an object or an argument by keyword whose name holds `password`, `secret`, `token`,
 /// `key`, `credential` or `auth`.
 pub(super) fn in_credential_binding(node: Node, src: &[u8]) -> bool {
+    in_credential_binding_under(node, node.parent(), src)
+}
+
+/// [`in_credential_binding`] for a reader that knows the parent of `node` already, so the first step up costs
+/// nothing (see [`is_name_of`]).
+pub(super) fn in_credential_binding_under(node: Node, parent: Option<Node>, src: &[u8]) -> bool {
     let mut child = node;
+    let mut known = parent;
 
     for _ in 0..BINDING_DEPTH {
-        let Some(parent) = child.parent() else {
+        let Some(parent) = known.take().or_else(|| child.parent()) else {
             return false;
         };
 
@@ -539,11 +725,23 @@ pub(super) fn in_credential_binding(node: Node, src: &[u8]) -> bool {
 /// when it is [`word_like`] and is bound to no name of a credential (a definition with one is checked by
 /// [`Extract::add_ref`]).
 pub(super) fn push_word(out: &mut Extract, from: Option<usize>, value: &str, node: Node, src: &[u8]) {
+    push_word_under(out, from, value, node, node.parent(), src);
+}
+
+/// [`push_word`] for a reader that knows the parent of `node` already.
+pub(super) fn push_word_under(
+    out: &mut Extract,
+    from: Option<usize>,
+    value: &str,
+    node: Node,
+    parent: Option<Node>,
+    src: &[u8],
+) {
     if !word_like(value) {
         return;
     }
 
-    if in_credential_binding(node, src) {
+    if in_credential_binding_under(node, parent, src) {
         return;
     }
 
@@ -552,7 +750,14 @@ pub(super) fn push_word(out: &mut Extract, from: Option<usize>, value: &str, nod
 
 /// True when `node` is the `name` field of its parent (the defining occurrence, not a use).
 pub(super) fn is_own_name(node: Node) -> bool {
-    node.parent()
+    is_name_of(node, node.parent())
+}
+
+/// [`is_own_name`] for a reader that knows the parent already: asking a node for its parent costs the number of
+/// siblings before it, which is quadratic over the thousands of children of a flat node (the `ERROR` node of a
+/// file that is cut off holds all its tokens as children).
+pub(super) fn is_name_of(node: Node, parent: Option<Node>) -> bool {
+    parent
         .and_then(|parent| parent.child_by_field_name("name"))
         .is_some_and(|name| name.id() == node.id())
 }
@@ -594,6 +799,7 @@ pub(super) fn push_def(
         sig: first_line(node, place.src),
         ret: None,
         test: place.test,
+        style: false,
     })
 }
 
@@ -649,6 +855,8 @@ pub(super) fn push_ref_recv(
         recv,
         line,
         handler: false,
+        style: false,
+        markup: false,
     });
 }
 
@@ -659,6 +867,24 @@ pub(super) fn push_use(
     name: &str,
     qual: Option<String>,
     node: Node,
+    src: &[u8],
+    line: usize,
+) {
+    push_use_under(out, from, name, qual, node, node.parent(), src, line);
+}
+
+/// [`push_use`] for a reader that knows the parent of `node` already (see [`is_name_of`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments of push_use and the parent of the node"
+)]
+pub(super) fn push_use_under(
+    out: &mut Extract,
+    from: Option<usize>,
+    name: &str,
+    qual: Option<String>,
+    node: Node,
+    parent: Option<Node>,
     src: &[u8],
     line: usize,
 ) {
@@ -679,7 +905,9 @@ pub(super) fn push_use(
         qual,
         recv: None,
         line,
-        handler: handled(node, src),
+        handler: handled_under(node, parent, src),
+        style: false,
+        markup: false,
     });
 }
 
@@ -715,10 +943,16 @@ const WRAPPERS: &[&str] = &[
 /// Rust `if let`. An event is set in one definition and handled in another: only the handling one is where
 /// the event leads to.
 pub(super) fn handled(node: Node, src: &[u8]) -> bool {
+    handled_under(node, node.parent(), src)
+}
+
+/// [`handled`] for a reader that knows the parent of `node` already, so the first step up costs nothing.
+fn handled_under(node: Node, parent: Option<Node>, src: &[u8]) -> bool {
     let mut child = node;
+    let mut known = parent;
 
     for _ in 0..MAX_HANDLER_CLIMB {
-        let Some(parent) = child.parent() else {
+        let Some(parent) = known.take().or_else(|| child.parent()) else {
             return false;
         };
         let within = |field: &str| {
@@ -1056,6 +1290,38 @@ mod tests {
         extract(&mut Parser::new(), path, src)
     }
 
+    #[test]
+    fn a_string_in_the_signature_of_a_style_definition_is_elided_as_a_stylesheet_would() {
+        let sym = |style: bool, sig: &str| Sym {
+            name: "$k".into(),
+            kind: "const",
+            parent: None,
+            line: 1,
+            end_line: 1,
+            sig: sig.into(),
+            ret: None,
+            test: false,
+            style,
+        };
+        let mut out = Extract::default();
+
+        out.syms.push(sym(true, "$k: \"abc\""));
+        elide_signatures(&mut out, "ts");
+
+        let shown = out.syms.first().map(|sym| sym.sig.as_str()).unwrap_or_default();
+
+        assert!(!shown.contains("abc"), "{shown}");
+        assert!(shown.starts_with("$k:"), "{shown}");
+
+        // the same text outside a style block is read as the file's language, which keeps a type-position string
+        let mut out = Extract::default();
+
+        out.syms.push(sym(false, "$k: \"abc\""));
+        elide_signatures(&mut out, "ts");
+
+        assert!(out.syms.first().is_some_and(|sym| sym.sig.contains("abc")));
+    }
+
     /// Whether each mention of `name` in `src` is where something is handled, in order.
     fn handlers(path: &str, src: &str, name: &str) -> Vec<bool> {
         run(path, src)
@@ -1254,6 +1520,10 @@ mod tests {
         assert_eq!(spec_for("ui/Card.svelte").map(|s| s.name), Some("ts"));
         assert_eq!(spec_for("main.go").map(|s| s.name), Some("go"));
         assert_eq!(spec_for("pkg/mod.PY").map(|s| s.name), Some("python"));
+        assert_eq!(spec_for("a/app.SASS").map(|s| s.name), Some("scss"));
+        assert_eq!(spec_for("a/theme.Less").map(|s| s.name), Some("scss"));
+        assert_eq!(spec_for("a/site.css").map(|s| s.name), Some("scss"));
+        assert_eq!(spec_for("public/Index.HTML").map(|s| s.name), Some("html"));
         assert!(spec_for("README.md").is_none());
         assert!(spec_for("Makefile").is_none());
     }
@@ -1328,7 +1598,8 @@ mod tests {
         let deep = format!("{}1{}", "(".repeat(20_000), ")".repeat(20_000));
 
         for path in [
-            "a.rs", "a.ts", "a.tsx", "a.js", "a.go", "a.py", "a.svelte", "a.vue", "a.astro",
+            "a.rs", "a.ts", "a.tsx", "a.js", "a.go", "a.py", "a.svelte", "a.vue", "a.astro", "a.css", "a.scss",
+            "a.sass", "a.less", "a.html",
         ] {
             for source in junk.iter().copied().chain([deep.as_str()]) {
                 let _ = run(path, source);
@@ -1419,6 +1690,35 @@ mod tests {
         assert!(out.syms.iter().any(|s| s.name == "f"));
         assert!(out.refs.iter().any(|r| r.name == "g"));
         assert!(out.syms.iter().all(|s| s.name != long));
+    }
+
+    #[test]
+    fn a_class_use_that_a_file_full_of_references_cannot_hold_marks_the_file() {
+        let mut out = Extract::default();
+
+        for n in 0..MAX_REFS_PER_FILE {
+            out.add_ref(Ref {
+                from: None,
+                name: format!("f{n}"),
+                kind: "call",
+                qual: None,
+                recv: None,
+                line: 1,
+                handler: false,
+                style: false,
+                markup: false,
+            });
+        }
+
+        assert!(!out.classes_cut);
+
+        out.add_class(None, "card", None, 1);
+
+        assert!(out.refs.iter().all(|r| r.kind != "cls"));
+        assert!(
+            out.classes_cut,
+            "the use was dropped, so a count of its selector may be low"
+        );
     }
 
     #[test]
@@ -1654,6 +1954,35 @@ mod tests {
         assert!(none.syms.is_empty());
         assert!(!out_of_time(), "the deadline of the call leaked into the next read");
         assert_eq!(run("a.rs", source).syms.len(), 1);
+    }
+
+    #[test]
+    fn a_class_in_a_definition_that_was_left_out_marks_the_file() {
+        let mut out = Extract::default();
+
+        out.add_class(Some(DROPPED), "card", None, 0);
+
+        assert!(out.refs.is_empty());
+        assert_eq!(out.dropped, 1);
+        assert!(out.classes_cut);
+    }
+
+    #[test]
+    fn a_script_that_was_not_parsed_marks_the_file_and_counts_a_drop() {
+        let out = extract_within(
+            &mut Parser::new(),
+            "A.vue",
+            "<script>const a = 'card';</script>\n",
+            Instant::now(),
+        );
+
+        assert!(out.dropped > 0);
+        assert!(out.classes_cut);
+
+        let out = extract_within(&mut Parser::new(), "a.ts", "const a = 1;\n", Instant::now());
+
+        assert!(out.dropped > 0);
+        assert!(out.classes_cut);
     }
 
     #[test]

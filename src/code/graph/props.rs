@@ -89,6 +89,8 @@ impl Graph {
                         recv: None,
                         line: 0,
                         handler: false,
+                        style: false,
+                        markup: false,
                     };
 
                     self.resolve_ref(&call)
@@ -133,6 +135,8 @@ impl Graph {
             recv: None,
             line: 0,
             handler: false,
+            style: false,
+            markup: false,
         };
         let mut targets: Vec<usize> = self
             .resolve_ref(&value)

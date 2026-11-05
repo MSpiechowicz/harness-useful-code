@@ -1,0 +1,17 @@
+@gap: 6px;
+@accent: #cc3333;
+
+.rounded(@r: 4px) {
+  border-radius: @r;
+}
+
+.theme {
+  .rounded(2px);
+  color: @accent;
+  margin: @gap;
+}
+
+.theme-dark {
+  &:extend(.theme);
+  background: #000;
+}

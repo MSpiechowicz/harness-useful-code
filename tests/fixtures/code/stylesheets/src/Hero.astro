@@ -1,0 +1,16 @@
+---
+const on = true;
+---
+
+<section class="tile">
+  <h1 class={on ? 'chip' : 'pill'}>hero</h1>
+  <p class="flag {on ? 'dot' : 'ring'}">text</p>
+  <p class:list={['tile', { halo: on }]}>more</p>
+</section>
+
+<style lang="sass">
+@use "./tokens/tokens" as t
+
+section
+  margin: t.$gap
+</style>

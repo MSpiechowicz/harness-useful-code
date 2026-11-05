@@ -710,6 +710,7 @@ fixture_tests! {
     fixture_esm_js, pending_fixture_esm_js, snapshot_fixture_esm_js => "esm-js";
     fixture_dispatch, pending_fixture_dispatch, snapshot_fixture_dispatch => "dispatch";
     fixture_bridge, pending_fixture_bridge, snapshot_fixture_bridge => "bridge";
+    fixture_stylesheets, pending_fixture_stylesheets, snapshot_fixture_stylesheets => "stylesheets";
 }
 
 // ---- the public repositories ----------------------------------------------------------------------------

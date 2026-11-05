@@ -17,7 +17,7 @@
 
 mod rules;
 
-use rules::{MASK, has_token, has_url_credentials, is_high_entropy, mask_formats, mask_tokens};
+use rules::{MASK, has_token, has_token_in_name, has_url_credentials, is_high_entropy, mask_formats, mask_tokens};
 
 /// Masks secrets in free text (note titles, bodies, tags): credential formats, `NAME=value`
 /// assignments with secret-looking names, URL userinfo and secret query values, and
@@ -65,6 +65,100 @@ pub fn redact_formats(text: &str) -> String {
 /// words do not count: a script reads its secrets from the environment.
 pub fn has_credentials(text: &str) -> bool {
     has_token(text) || has_url_credentials(text)
+}
+
+/// Formats that start with a prefix no ordinary word ends in (`ghp_`, `glpat-`, `AKIA`): a name may have glued one
+/// to the word before it (`.pghp_x`), so these are tried from every place they are written.
+const GLUEABLE_STARTS: &[&str] = &[
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "ghu_",
+    "github_pat_",
+    "xoxa-",
+    "xoxb-",
+    "xoxp-",
+    "xoxr-",
+    "xoxs-",
+    "AKIA",
+    "AIza",
+    "glpat-",
+    "npm_",
+    "eyJ",
+    "-----BEGIN ",
+];
+
+/// Formats whose prefix ends ordinary words (`task-`, `disk-`, `risk_live_`, `pdf_`): trying them from every place
+/// they are written would drop `.task-list-item-checkbox`, so they are tried only after an underscore (`.a_sk-x`),
+/// which gives the plain check no word boundary; at a name start or after `-` or `.` it already finds them.
+const SEPARATED_STARTS: &[&str] = &["sk-", "hf_", "sk_live_", "sk_test_", "rk_live_", "rk_test_"];
+
+/// The suffixes of a name that are tried apart from it: a name of the length an index keeps holds fewer.
+const MAX_GLUED_STARTS: usize = 64;
+
+/// [`has_credentials`] for a name that is made of parts (a selector built by nesting, `.p` and `&ghp_x`, or a
+/// class written after an underscore): a credential format is matched at a word boundary, and a name has glued
+/// it to the word before it (`.pghp_x`, `.a_ghp_x`), where no boundary is. A format with a distinctive prefix is
+/// therefore tried from every place it is written; one whose prefix ends ordinary words (`sk-` in `task-`) only
+/// after an underscore, so that `.task-list-item-checkbox` and `.disk-usage-warning-panel` are no credentials.
+/// A bare `sk-` key counts only with a tail that looks random (a digit, an upper and a lower case letter), so
+/// `.sk-circle-loader-wrapper-outer` is a selector. The name is tried again without its whitespace, which a
+/// comment inside a name (`.ghp_/**/…`) leaves behind. A text with more starts than [`MAX_GLUED_STARTS`] is no
+/// name; it counts as a credential, so the work stays bounded.
+pub fn has_credentials_in_name(text: &str) -> bool {
+    if name_holds_credential(text) {
+        return true;
+    }
+
+    if !text.contains(char::is_whitespace) {
+        return false;
+    }
+
+    let joined: String = text.chars().filter(|character| !character.is_whitespace()).collect();
+
+    name_holds_credential(&joined)
+}
+
+/// One pass of [`has_credentials_in_name`] over a text as it is.
+fn name_holds_credential(text: &str) -> bool {
+    if has_token_in_name(text) || has_url_credentials(text) {
+        return true;
+    }
+
+    let bytes = text.as_bytes();
+    let glued = GLUEABLE_STARTS
+        .iter()
+        .flat_map(|start| text.match_indices(start).map(|(at, _)| at));
+    let separated = SEPARATED_STARTS.iter().flat_map(|start| {
+        text.match_indices(start)
+            .map(|(at, _)| at)
+            .filter(|at| at.checked_sub(1).and_then(|before| bytes.get(before)) == Some(&b'_'))
+    });
+
+    let mut starts: Vec<usize> = glued.chain(separated).collect();
+
+    starts.sort_unstable();
+    starts.dedup();
+
+    if starts.len() > MAX_GLUED_STARTS {
+        return true;
+    }
+
+    starts.into_iter().any(|at| {
+        let Some(rest) = text.get(at..) else {
+            return false;
+        };
+
+        has_token_in_name(rest) || is_glued_aws_key(rest)
+    })
+}
+
+/// True when `text` starts with an AWS access key id that something is written right after (`AKIA…_x`): the
+/// format asks for a boundary after it, and a name has none.
+fn is_glued_aws_key(text: &str) -> bool {
+    text.strip_prefix("AKIA")
+        .and_then(|rest| rest.as_bytes().get(..16))
+        .is_some_and(|id| id.iter().all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase()))
 }
 
 #[cfg(test)]
@@ -133,6 +227,97 @@ mod tests {
         // too short to be a key, and a name that only starts like one
         assert!(!has_credentials(&["sk_live_", "short"].concat()));
         assert!(!has_credentials("risk_live_values_of_the_market"));
+    }
+
+    #[test]
+    fn a_credential_glued_to_a_word_of_a_name_is_found_where_a_boundary_is_not() {
+        let tail = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4";
+        let token = ["gh", "p_", tail].concat();
+
+        for glued in [
+            format!(".p{token}"),
+            format!(".a_{token}"),
+            format!(".x-{token}"),
+            format!("a{token}-hover"),
+        ] {
+            assert!(has_credentials_in_name(&glued), "{glued}");
+        }
+
+        // the plain check keeps its meaning for every other caller
+        assert!(!has_credentials(&format!(".p{token}")));
+        assert!(has_credentials_in_name(&token));
+
+        // names that only look like a start
+        for fine in [".ghp_short", ".sk-circle", ".BasicButton", ".github_pat", ".npm_run"] {
+            assert!(!has_credentials_in_name(fine), "{fine}");
+        }
+    }
+
+    #[test]
+    fn real_names_that_end_in_a_credential_prefix_are_no_credentials() {
+        let names = [
+            ".task-list-item-checkbox",
+            ".disk-usage-warning-panel",
+            ".mask-image-container-wrapper",
+            "$mask-image-container-wrapper",
+            "--task-list-item-checkbox-bg",
+            "disk-usage-warning-pulse",
+            ".flask-application-wrapper-x",
+            ".desk-reservation-calendar-grid",
+            ".risk-assessment-summary-table",
+            ".ask-the-community-widget-box",
+            ".sk-circle-loader-wrapper-outer",
+            ".token",
+            ".password-field",
+            ".api-key",
+            ".auth-card",
+            ".secret-banner",
+            ".key-hint",
+            ".card__title--highlighted-state",
+            ".block__element_modifier-value-long",
+            ".hover\\:bg-blue-500",
+            ".w-1\\/2.md\\:flex.dark\\:text-gray-100",
+            ".risk_live_values_of_the_market",
+            ".pdf_viewer_container_wrapper_x",
+        ];
+
+        for name in names {
+            assert!(!has_credentials_in_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn synthetic_credentials_in_a_name_are_found_however_they_are_glued() {
+        let tail = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+        let aws = ["AKIA", "ABCDEFGHIJKLMNOP"].concat();
+        let found = [
+            [".ghp_", tail].concat(),
+            [".task-ghp_", tail].concat(),
+            [".gho_", tail].concat(),
+            [".ghu_", tail].concat(),
+            [".ghs_", tail].concat(),
+            [".github_pat_", tail].concat(),
+            [".glpat-", tail].concat(),
+            [".xoxb-", "1234567890-abcdefghij"].concat(),
+            [".npm_", tail].concat(),
+            [".sk_live_", "4eC39HqLyjWDarjtT1zdp7dc"].concat(),
+            [".a_sk_test_", "4eC39HqLyjWDarjtT1zdp7dc"].concat(),
+            [".sk-", tail].concat(),
+            ["sk-ant-", tail].concat(),
+            [".a_sk-", tail].concat(),
+            [".disk-sk-", tail].concat(),
+            format!(".{aws}"),
+            format!(".{aws}_x"),
+            format!(".{aws}x"),
+            format!(".pre{aws}"),
+            // a comment inside the name leaves whitespace between its parts
+            [".ghp_ ", tail].concat(),
+            [".ghp_\t\n", tail].concat(),
+        ];
+
+        for name in found {
+            assert!(has_credentials_in_name(&name), "{name}");
+        }
     }
 
     #[test]

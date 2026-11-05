@@ -1,7 +1,7 @@
 //! `harness-code`: a code graph MCP server for any coding agent harness.
 //!
 //! It indexes a repository's files with tree-sitter (Rust, TypeScript and JavaScript with their component
-//! formats, Go and Python) and answers where code is defined, who uses it and how one thing reaches another.
+//! formats, Go, Python, SCSS and CSS, indented Sass, Less and HTML) and answers where code is defined, who uses it and how one thing reaches another.
 //! Agents ask through four tools (`code_map`, `code_symbol`, `code_impact`, `code_path`), and Harness Desktop and
 //! the other Harness family members through a few commands. It works without any other member installed.
 //!

@@ -43,6 +43,20 @@ impl Graph {
     pub(super) fn site_text(&self, ri: usize) -> Option<String> {
         let r = self.refs.get(ri)?;
         let file = self.files.get(r.file)?;
+
+        // A class name sits in markup, where a line holds the text of a page, a comment, an attribute value
+        // without quotes or the child text of a JSX element, and no scan of a single line can tell them from
+        // code. That text is written by whoever wrote the page, so a class use gives its place alone. So does
+        // a `<style>` block of a component (its line is no line of a stylesheet) and every reference in an
+        // HTML page. So does every reference written in markup (a template, JSX): the line of a `component`, a
+        // `str` or a `call` there holds the text of the page around it, and in JSX a child line has no tag on it
+        // and a text node spans lines, so only where the extractor saw the reference can say it.
+        let html = file.path.to_ascii_lowercase().ends_with(".html") || file.lang == "html";
+
+        if r.kind == "cls" || r.markup || html || (r.style && file.lang != "scss") {
+            return None;
+        }
+
         let mut lines = walk::read_lines(
             Path::new(&self.root),
             &file.path,
@@ -52,8 +66,10 @@ impl Graph {
             site_scan::CONTEXT_LINES,
         )?;
         let raw = lines.pop().filter(|raw| !raw.is_empty())?;
-        let masked = readable(file.lang, &lines, &raw, &r.name, &r.kind)?;
-        let elided = extract::elide_line(&masked, file.lang);
+
+        let lang = self.lang_of_ref(ri);
+        let masked = readable(lang, &lines, &raw, &r.name, &r.kind)?;
+        let elided = extract::elide_line(&masked, lang);
         let squeezed = elided.split_whitespace().collect::<Vec<_>>().join(" ");
         let escaped = shown(&squeezed);
 
@@ -104,8 +120,8 @@ fn readable(lang: &str, above: &[String], raw: &str, name: &str, kind: &str) -> 
         return None;
     }
 
-    // the name is code (a string that names a definition is the reference itself)
-    if kind != "str" && !name.is_empty() {
+    // the name is code (a string that names a definition, or a class a string writes, is the reference itself)
+    if !matches!(kind, "str" | "cls") && !name.is_empty() {
         let mut found = scanned.text.match_indices(name).peekable();
         let in_string = |at: usize| scanned.strings.iter().any(|(from, to)| *from <= at && at < *to);
 

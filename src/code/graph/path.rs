@@ -64,6 +64,20 @@ impl Graph {
     /// The shortest chain of at most `max_depth` hops from `from` to `to`, or from `to` to `from` when
     /// there is none that way, or a message saying there is no chain.
     pub fn path(&self, from: &str, to: &str, max_depth: usize) -> String {
+        // a file the index left out is told on its own, and that says the rest
+        for end in [from, to] {
+            if let Some(note) = self.left_out_note(end.trim()) {
+                return note;
+            }
+        }
+
+        // `no chain` can be false when a file `.gitattributes` marks generated holds the caller
+        let answer = self.path_of(from, to, max_depth);
+
+        self.with_attributes_note(answer)
+    }
+
+    fn path_of(&self, from: &str, to: &str, max_depth: usize) -> String {
         let max = max_depth.clamp(1, 10);
         let (from, to) = (from.trim(), to.trim());
         let start = self.endpoint(from, MAX_ENDS);
@@ -355,12 +369,16 @@ impl Graph {
                 continue;
             };
 
-            if r.kind == "type" {
+            // a class use is no call: the weak pass that explains a failed search must not wander into a
+            // stylesheet and report a selector as how far the search got
+            if r.kind == "type" || (weak && r.kind == "cls") {
                 continue;
             }
 
             for &(target, weight) in self.res.get(ri).map(Vec::as_slice).unwrap_or(&[]) {
-                if weight < MIN_WEIGHT {
+                // a chain is printed as fact, so a class that only the name links (weight below 1) is no step
+                // of one; `code_impact` follows it and marks it
+                if weight < MIN_WEIGHT || (r.kind == "cls" && weight < 1.0) {
                     continue;
                 }
 

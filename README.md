@@ -68,7 +68,7 @@ harness does not see your user `PATH`.
 
 | Tool | What it does |
 | --- | --- |
-| `code_map` | A ranked map of a project's key files with their signatures, within a token budget (`budget` 200 to 4000, default 700), optionally centred on what the task names (`query`: a symbol, a file path or words such as `checkout retry`, read like a `code_path` end; the definitions it names are listed first even when no other file uses them, and one that names nothing is answered `nothing matches <query>; map without it:` before the plain map) and/or on a path prefix (`focus`, relative to the project, with or without `./` or the project root; one that matches no indexed file is answered `no indexed files under <focus>`). Tests are left out. Where no definition is used by another file, each file lists its top definitions instead. For an unfamiliar area, before grep |
+| `code_map` | A ranked map of a project's key files with their signatures, within a token budget (`budget` 200 to 4000, default 700), optionally centred on what the task names (`query`: a symbol, a file path or words such as `checkout retry`, read like a `code_path` end; the definitions it names are listed first even when no other file uses them; a bare `station` also finds the selector `.station`; words no definition holds are read against the folders, names and extensions of the files, and `css`, `scss`, `sass`, `style` or `stylesheet` (and their plurals) find the stylesheets; one that names nothing is answered `nothing matches <query>; map without it:` before the plain map) and/or on a path prefix (`focus`, relative to the project, with or without `./` or the project root, `.` being the project itself; one that matches no indexed file is answered `no indexed files under <focus>`). Tests are left out. Where no definition is used by another file, each file lists its top definitions instead. A stylesheet lists the classes pages write most, each selector once, and selectors like `*`, `html` or `:root` last; class uses never change the order of the files. For an unfamiliar area, before grep |
 | `code_symbol` | Where a function, type or constant is defined (`name`, `Type::name`, `module::name` or `path/fragment::name`; a repository-relative file path lists the file's most used definitions), what it uses and who uses it, with `path:line` and, for the first sites of each list, the line of source that makes the link. `limit` 1 to 50 (default 20). A link found only by a shared name is marked `(by name)`, an uncertain one `?` |
 | `code_impact` | Everything that depends on a symbol or a file (all its definitions), by caller depth (`depth` 1 to 4, default 2), one `caller → callee` line each, tests summarised per file. For before a signature changes |
 | `code_path` | How A reaches B (`from`, `to`, `max_depth` 1 to 10, default 8): the shortest chain of calls, renders, shared constants and name links, one hop per line with `path:line` and, under it, the call site. An end is a symbol, a repository-relative file path, a string that names no symbol (an event name, the definitions that write it) or plain words (`/useful-skills doctor`, `the diff view loads the lines`). Tries the other direction when nothing leads forward |
@@ -81,8 +81,26 @@ agents to use the tools before grep.
 ## How the index works
 
 It is built from the project's files with tree-sitter (Rust, TypeScript and JavaScript, `.svelte`, `.vue`
-and `.astro` files, Go, Python, SCSS and CSS: every selector, nested ones named as they apply, wherever the
-rule is written). It is on by default.
+and `.astro` files, Go, Python, SCSS, CSS, indented Sass, Less and HTML). It is on by default.
+
+- **Stylesheets.** Every selector of a `.css`, `.scss`, `.sass` or `.less` file, and of a `<style>` block of
+  a `.vue`, `.svelte` or `.astro` file (`lang` css, scss, sass or less), is a definition, nested ones named as
+  they apply and each at its own line, with the `$tokens`, `@variables`, mixins, functions and `@keyframes`
+  of the sheet. A token, mixin, `@extend` or `animation` name in a sheet or block reaches where it is defined.
+  The class names a component or page writes (`class`, `className`, `:class`, `class:foo`, `class:list`,
+  `clsx(...)`, `cn(...)`, `classnames(...)`, `twMerge(...)`, `cva(...)`, `styles.card` of a CSS module, and a helper made with `classNames.bind(styles)`; in scripts also
+  `x.classList.add(...)`, `x.className = ...`, the selector of `x.querySelector(...)` and `x.getElementsByClassName(...)`,
+  a prop or key ending in `ClassName`, and a same-file `const` that stands in any of these places)
+  reach the selectors that style them, so `code_symbol` on a selector lists the files that use it and
+  `code_impact` on a token follows it through the selector to the components. A use reaches the nearest
+  stylesheet that holds the class (the file's own `<style>`, then the sheets it imports, then the package, then
+  the repository); the last two are matches by name and read `?`. `styles.card` and a bound helper reach only the
+  module they were imported from. Not read: class names built at run time (`` `btn-${size}` ``), a `let`, a
+  parameter or an imported name, a constant in a `.vue`, `.svelte` or `.astro` template, `composes`, escaped
+  selectors and Tailwind utilities that no stylesheet defines. A selector that reads `used by 0` says
+  whether its class is written elsewhere.
+- **Generated files.** A file that a `.gitattributes` (or `.git/info/attributes`) marks `linguist-generated` is
+  left out of the index and the tools say so when asked for it.
 
 - **Always fresh.** Each `code_*` call compares the size and modification time of the files with the
   index, reads only the ones that changed and answers from the updated graph. There is no watcher, no

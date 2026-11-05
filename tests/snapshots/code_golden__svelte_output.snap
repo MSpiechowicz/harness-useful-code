@@ -18,7 +18,7 @@ component TodoItem  src/lib/TodoItem.svelte:1-8
   uses:
     countTodos src/lib/store.ts:13  at src/lib/TodoItem.svelte:5 | const position = countTodos();
   used by 1 site(s):
-    src/App.svelte:12 App | <TodoItem label="…" />
+    src/App.svelte:12 App
 
 == symbol addTodo
 fn addTodo  src/lib/store.ts:7-11

@@ -36,6 +36,7 @@ use super::packages::normalize;
 use super::store::db;
 use super::walk::TOO_LARGE;
 
+pub(in crate::code) mod classes;
 mod dispatch;
 mod endpoint;
 mod go;
@@ -135,6 +136,9 @@ struct Sym {
     ret: Option<String>,
     /// In a test file or a `#[cfg(test)]` module.
     test: bool,
+    /// Written in the `<style>` block of a component: it follows the rules of a stylesheet, not those of the
+    /// file's own language.
+    style: bool,
 }
 
 struct Ref {
@@ -149,6 +153,10 @@ struct Ref {
     /// A mention of a constant where something is handled (a `case` label or an equality test): the only kind
     /// of use a shared constant bridges `code_path` to.
     handler: bool,
+    /// Written in the `<style>` block of a component (see [`Sym::style`]).
+    style: bool,
+    /// Written in a template or in JSX: the answer gives the place of the reference and never its line.
+    markup: bool,
 }
 
 /// Where a string that names no definition is written.
@@ -204,6 +212,12 @@ pub struct Graph {
     path_idx: HashMap<String, usize>,
     /// The paths of the files that were not read: a query for one is told so.
     left_out: Vec<String>,
+    /// The paths among them that `.gitattributes` marks generated, which is the repository's claim and no
+    /// check: every answer says that such files are not in the index.
+    attr_marked: Vec<String>,
+    /// The paths of the stylesheets that lost selectors to the caps of the index: an answer about one, or that
+    /// finds nothing, says it may be incomplete.
+    selector_cut: Vec<String>,
     imports: HashMap<(usize, String), Imp>,
     /// Per file: what it passes on with `export ... from`.
     reexports: HashMap<usize, ts::Reexports>,
@@ -237,6 +251,8 @@ pub struct Graph {
     bases: dispatch::Bases,
     /// What the scans may still visit (see [`SCAN_BUDGET`]).
     scan_left: AtomicUsize,
+    /// What the class links left out (see `classes`).
+    classes: classes::Report,
 }
 
 /// The language-specific steps of resolution. A step answers `Some(targets)` to settle the reference
@@ -486,7 +502,7 @@ impl Graph {
         let mut syms = Vec::new();
         let mut sym_index: HashMap<i64, usize> = HashMap::new();
         let mut statement = conn
-            .prepare("SELECT id, file_id, name, kind, parent, line, end_line, sig, ret, test FROM symbols WHERE repo_id = ?1 ORDER BY id")
+            .prepare("SELECT id, file_id, name, kind, parent, line, end_line, sig, ret, test, style FROM symbols WHERE repo_id = ?1 ORDER BY id")
             .map_err(db)?;
         let rows = statement
             .query_map([repo], |row| {
@@ -501,6 +517,7 @@ impl Graph {
                     row.get::<_, String>(7)?,
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, bool>(9)?,
+                    row.get::<_, bool>(10)?,
                 ))
             })
             .map_err(db)?;
@@ -512,7 +529,7 @@ impl Graph {
                 return Err(TOO_LARGE.into());
             }
 
-            let (id, file_id, name, kind, parent, line, end_line, sig, ret, test) = row.map_err(db)?;
+            let (id, file_id, name, kind, parent, line, end_line, sig, ret, test, style) = row.map_err(db)?;
             let Some(&file) = file_index.get(&file_id) else {
                 continue;
             };
@@ -529,6 +546,7 @@ impl Graph {
                 sig,
                 ret,
                 test: test || in_test_file,
+                style,
             });
         }
 
@@ -586,6 +604,11 @@ impl Graph {
             .map(|sym| sym.name.as_str())
             .collect();
 
+        // the class tokens some file writes, and the selectors that hold them: a use no selector styles is never
+        // loaded, so a repository of utility classes costs nothing for the classes it has no stylesheet for
+        let class_index = classes::index(&syms, &files, &used_class_tokens(conn, repo)?);
+        let mut class_kept = 0_usize;
+        let mut class_dropped = 0_usize;
         let mut refs = Vec::new();
         let mut prop_rows: Vec<props::PropRow> = Vec::new();
         let mut loose: HashMap<String, Vec<Mention>> = HashMap::new();
@@ -596,7 +619,7 @@ impl Graph {
         let mut bases = dispatch::Bases::default();
         let mut statement = conn
             .prepare(
-                "SELECT file_id, from_symbol, name, kind, qual, recv, line, handler FROM refs WHERE repo_id = ?1 ORDER BY id",
+                "SELECT file_id, from_symbol, name, kind, qual, recv, line, handler, style, markup FROM refs WHERE repo_id = ?1 ORDER BY id",
             )
             .map_err(db)?;
         let rows = statement
@@ -610,6 +633,8 @@ impl Graph {
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, i64>(6)?,
                     row.get::<_, i64>(7)? != 0,
+                    row.get::<_, i64>(8)? != 0,
+                    row.get::<_, i64>(9)? != 0,
                 ))
             })
             .map_err(db)?;
@@ -617,14 +642,31 @@ impl Graph {
         for (count, row) in rows.enumerate() {
             poll(pace, count)?;
 
-            if refs.len() + prop_rows.len() >= MAX_REFS {
+            // the class uses that are kept have a count and a cap of their own
+            if refs.len() - class_kept + prop_rows.len() >= MAX_REFS {
                 return Err(TOO_LARGE.into());
             }
 
-            let (file_id, from, name, kind, qual, recv, line, handler) = row.map_err(db)?;
+            let (file_id, from, name, kind, qual, recv, line, handler, style, markup) = row.map_err(db)?;
             let Some(&file) = file_index.get(&file_id) else {
                 continue;
             };
+
+            // a class token is kept only when a selector holds it, and within a cap, the rest counted. It is a
+            // reference of its own kind: the default kind rule would let it reach a function of the same name,
+            // so the code links skip it and the class links read it
+            if kind == "cls" {
+                if !class_index.contains_key(&name) {
+                    continue;
+                }
+
+                if class_kept >= classes::MAX_CLASS_REFS {
+                    class_dropped += 1;
+                    continue;
+                }
+
+                class_kept += 1;
+            }
 
             // a word literal is no reference either: it only tells which definition a word of a question may mean
             if kind == "word" {
@@ -695,11 +737,12 @@ impl Graph {
             }
 
             // a constant-looking name that no constant of the repository carries (under the name it is
-            // imported from, if it is imported) could never resolve: it is no reference
+            // imported from, if it is imported) could never resolve: it is no reference. A name written in a
+            // style block is not looked up among the imports of the script next to it
             if kind == "use" {
                 let written = imports
                     .get(&(file, name.clone()))
-                    .filter(|import| import.orig != "*")
+                    .filter(|import| !style && import.orig != "*")
                     .map_or(name.as_str(), |import| import.orig.as_str());
 
                 if !valued.contains(written) {
@@ -716,6 +759,8 @@ impl Graph {
                 recv,
                 line,
                 handler,
+                style,
+                markup,
             });
         }
 
@@ -733,7 +778,8 @@ impl Graph {
                 by_owner.entry((sym.name.clone(), owner.clone())).or_default().push(i);
             }
 
-            if TYPE_KINDS.contains(&sym.kind.as_str())
+            if !sym.style
+                && TYPE_KINDS.contains(&sym.kind.as_str())
                 && let Some(file) = files.get(sym.file)
             {
                 type_defs.insert((file.lang, sym.name.clone()));
@@ -754,8 +800,26 @@ impl Graph {
                     .collect::<rusqlite::Result<Vec<_>>>()
             })
             .map_err(db)?;
+        let attr_marked = conn
+            .prepare("SELECT path FROM files WHERE repo_id = ?1 AND hash = '' AND attr_generated <> 0 ORDER BY path")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([repo], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(db)?;
+        let selector_cut = conn
+            .prepare("SELECT path FROM files WHERE repo_id = ?1 AND hash <> '' AND selector_cut <> 0 ORDER BY path")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([repo], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(db)?;
         let mut graph = Graph {
             left_out,
+            attr_marked,
+            selector_cut,
             root,
             files,
             syms,
@@ -783,10 +847,22 @@ impl Graph {
             props: HashMap::new(),
             bases,
             scan_left: AtomicUsize::new(SCAN_BUDGET),
+            classes: classes::Report {
+                over: class_index
+                    .iter()
+                    .filter(|(_, selectors)| selectors.is_over())
+                    .map(|(token, selectors)| (token.clone(), selectors.total()))
+                    .collect(),
+                cut_files: class_cut_files(conn, repo)?,
+                cut_pages: class_cut_pages(conn, repo)?,
+                cut_uses: class_dropped,
+                edges: 0,
+                written: HashSet::new(),
+            },
         };
 
         graph.bind_props(prop_rows, pace)?;
-        graph.link(pace)?;
+        graph.link(pace, &class_index)?;
 
         Ok(graph)
     }
@@ -794,7 +870,7 @@ impl Graph {
     /// Resolves every reference: code references first, then string names, which prefer entry points
     /// (definitions without direct callers in their own language). The edges are capped: past
     /// [`MAX_EDGES`] the remaining references stay unresolved.
-    fn link(&mut self, pace: &Pace) -> Result<(), String> {
+    fn link(&mut self, pace: &Pace, class_index: &classes::ClassIndex) -> Result<(), String> {
         let mut res: Vec<Vec<(usize, f32)>> = Vec::with_capacity(self.refs.len());
         let mut soft: Vec<bool> = Vec::with_capacity(self.refs.len());
         let mut edges = 0_usize;
@@ -802,7 +878,8 @@ impl Graph {
         for ri in 0..self.refs.len() {
             poll(pace, ri)?;
 
-            let settled = if edges >= MAX_EDGES || self.is_string(ri) {
+            // a class use has its own pass, with its own budget
+            let settled = if edges >= MAX_EDGES || self.is_string(ri) || self.is_class(ri) {
                 Resolved::none()
             } else {
                 self.resolve(ri)
@@ -842,6 +919,16 @@ impl Graph {
             }
         }
 
+        // the class uses come last, so that what they link cannot spend the budget of the code. A load that is
+        // out of time before they begin fails as before; one that runs out inside them keeps its code links
+        pace.check()?;
+
+        let (class_edges, unlinked, written) = self.link_classes(&mut res, class_index, pace)?;
+
+        self.classes.edges = class_edges;
+        self.classes.cut_uses += unlinked;
+        self.classes.written = written;
+
         for (ri, targets) in res.iter().enumerate() {
             if !targets.is_empty() {
                 self.resolved += 1;
@@ -870,18 +957,32 @@ impl Graph {
         self.refs.get(ri).is_some_and(|r| r.kind == "str")
     }
 
-    fn lang_of_ref(&self, ri: usize) -> &str {
-        self.refs
-            .get(ri)
-            .and_then(|r| self.files.get(r.file))
-            .map_or("", |f| f.lang)
+    /// True for a class token written in code (see `classes`).
+    fn is_class(&self, ri: usize) -> bool {
+        self.refs.get(ri).is_some_and(|r| r.kind == "cls")
     }
 
-    fn lang_of_sym(&self, sym: usize) -> &str {
-        self.syms
-            .get(sym)
-            .and_then(|s| self.files.get(s.file))
-            .map_or("", |f| f.lang)
+    /// The language a reference is written in: a reference in the `<style>` block of a component is
+    /// stylesheet code, whatever the file around it is.
+    fn lang_of_ref(&self, ri: usize) -> &'static str {
+        self.refs.get(ri).map_or("", |r| {
+            if r.style {
+                return "scss";
+            }
+
+            self.files.get(r.file).map_or("", |f| f.lang)
+        })
+    }
+
+    /// The language a definition is written in (see [`Graph::lang_of_ref`]).
+    fn lang_of_sym(&self, sym: usize) -> &'static str {
+        self.syms.get(sym).map_or("", |s| {
+            if s.style {
+                return "scss";
+            }
+
+            self.files.get(s.file).map_or("", |f| f.lang)
+        })
     }
 
     /// The file of a symbol.
@@ -952,8 +1053,15 @@ impl Graph {
             text += 64 + long(word) + syms.len() * 8;
         }
 
+        // a class token on too many selectors is kept with its count; each class link is a target and a back reference
+        text += self.classes.over.keys().map(|token| 64 + long(token)).sum::<usize>();
+        text += self.classes.edges.saturating_mul(24);
+        text += self.classes.written.iter().map(|token| 64 + long(token)).sum::<usize>();
+
         text += self.bases.estimated_bytes();
         text += self.left_out.iter().map(String::len).sum::<usize>();
+        text += self.attr_marked.iter().map(String::len).sum::<usize>();
+        text += self.selector_cut.iter().map(String::len).sum::<usize>();
 
         self.refs
             .len()
@@ -1069,11 +1177,17 @@ impl Graph {
         let Some(file) = self.files.get(r.file) else {
             return Resolved::none();
         };
-        let Some(rules) = rules(file.lang) else {
+        let lang = if r.style { "scss" } else { file.lang };
+        let Some(rules) = rules(lang) else {
             return Resolved::none();
         };
 
-        let import = self.imports.get(&(r.file, r.name.clone()));
+        // a name written in a style block is not one the script next to it imports
+        let import = if r.style {
+            None
+        } else {
+            self.imports.get(&(r.file, r.name.clone()))
+        };
         let name = import
             .filter(|i| i.orig != "*")
             .map_or(r.name.as_str(), |i| i.orig.as_str());
@@ -1089,7 +1203,7 @@ impl Graph {
         let bare_call = r.kind == "call" && r.qual.is_none();
         let skip_methods = rules.bare_call_skips_methods() && bare_call;
         let namespace = r.kind == "mcall" && self.is_namespace(r.file, r.qual.as_deref());
-        let keep = |s: usize| self.candidate(r, file.lang, skip_methods, namespace, s);
+        let keep = |s: usize| self.candidate(r, lang, skip_methods, namespace, s);
 
         // 0. the receiver's written type: a method call only means the methods of that type
         let mut owned: Option<Vec<usize>> = None;
@@ -1103,7 +1217,7 @@ impl Graph {
 
             if !own.is_empty() {
                 owned = Some(own);
-            } else if !self.defines_type(file.lang, &ty) {
+            } else if !self.defines_type(lang, &ty) {
                 return Resolved::none(); // a method of a type the repository does not define
             }
         }
@@ -1376,13 +1490,7 @@ impl Graph {
             }
         }
 
-        hits.sort_by_key(|s| {
-            (
-                self.file_of(*s).is_some_and(|f| f.test),
-                std::cmp::Reverse(self.incoming.get(*s).map_or(0, Vec::len)),
-                *s,
-            )
-        });
+        hits.sort_by_cached_key(|s| (self.file_of(*s).is_some_and(|f| f.test), self.use_rank(*s), *s));
 
         hits
     }
@@ -1481,7 +1589,43 @@ impl Graph {
     }
 }
 
-/// Polls the pace once every [`POLL_EVERY`] steps.
+/// The class tokens the files of repository `repo` write.
+fn used_class_tokens(conn: &Connection, repo: i64) -> Result<HashSet<String>, String> {
+    let mut statement = conn
+        .prepare("SELECT DISTINCT name FROM refs WHERE repo_id = ?1 AND kind = 'cls'")
+        .map_err(db)?;
+    let names = statement
+        .query_map([repo], |row| row.get::<_, String>(0))
+        .map_err(db)?
+        .collect::<rusqlite::Result<HashSet<_>>>()
+        .map_err(db)?;
+
+    Ok(names)
+}
+
+/// How many files had class tokens cut when they were stored (a file past its cap, or the repository past its
+/// own).
+fn class_cut_files(conn: &Connection, repo: i64) -> Result<usize, String> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE repo_id = ?1 AND class_cut <> 0",
+            [repo],
+            |row| row.get(0),
+        )
+        .map_err(db)?;
+
+    Ok(usize::try_from(count).unwrap_or(0))
+}
+
+/// How many `.html` pages the walk left out of the repository (see `Walked::pages_cut`).
+fn class_cut_pages(conn: &Connection, repo: i64) -> Result<usize, String> {
+    let count: i64 = conn
+        .query_row("SELECT pages_cut FROM repos WHERE id = ?1", [repo], |row| row.get(0))
+        .map_err(db)?;
+
+    Ok(usize::try_from(count).unwrap_or(0))
+}
+
 /// The resident memory of this process, in bytes, where the system says (Linux). A worker compares it before
 /// and after it loads a graph to record how much memory the graph took.
 pub fn resident_bytes() -> Option<usize> {
@@ -1505,6 +1649,7 @@ pub fn resident_bytes() -> Option<usize> {
     }
 }
 
+/// Polls the pace once every [`POLL_EVERY`] steps.
 fn poll(pace: &Pace, count: usize) -> Result<(), String> {
     if count.is_multiple_of(POLL_EVERY) {
         pace.check()?;

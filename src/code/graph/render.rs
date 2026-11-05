@@ -3,6 +3,7 @@
 //! Every list is capped, tests are summarised per file, and every impact entry reads `caller → callee`
 //! (an agent invents chains otherwise).
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write;
 
@@ -63,6 +64,24 @@ impl Graph {
     /// listed even when no other file uses them. Test files are left out. When no definition is used by another file, each file lists its top definitions
     /// instead.
     pub fn map(&self, budget: usize, focus: Option<&str>, query: Option<&str>) -> String {
+        let answer = self.map_files(budget, focus, query);
+
+        self.with_attributes_note(answer)
+    }
+
+    /// `answer` and, when `.gitattributes` keeps files out of the index, a line that says so: with every file
+    /// marked, the folder would otherwise look empty.
+    pub(super) fn with_attributes_note(&self, mut answer: String) -> String {
+        let note = self.attributes_note();
+
+        if !note.is_empty() && !answer.ends_with('\n') {
+            answer.push('\n');
+        }
+
+        answer + &note
+    }
+
+    fn map_files(&self, budget: usize, focus: Option<&str>, query: Option<&str>) -> String {
         if self.files.is_empty() {
             return "No source files are indexed in this folder.\n".to_string();
         }
@@ -162,8 +181,15 @@ impl Graph {
                 })
         });
 
+        // a page with nothing to show is a line of noise among the code, but a repository of pages only still
+        // gets its answer
+        let only_pages = order
+            .iter()
+            .all(|f| self.files.get(*f).is_some_and(|file| file.lang == "html"));
         let mut out = String::new();
         let mut listed = Vec::new();
+        // the note about `.gitattributes` is added after the map, so the files are listed within what it leaves
+        let note = tokens(&self.attributes_note());
 
         for file in order {
             let Some(entry) = self.files.get(file) else {
@@ -177,7 +203,7 @@ impl Graph {
                     list.iter()
                         .copied()
                         .filter(|s| {
-                            (!linked || sym_rank(*s) > 0.0 || seed_syms.contains(s))
+                            (!linked || sym_rank(*s) > 0.0 || seed_syms.contains(s) || self.class_uses(*s) > 0)
                                 && self.syms.get(*s).is_some_and(|sym| !sym.test)
                         })
                         .collect()
@@ -196,24 +222,46 @@ impl Graph {
                             .collect()
                     })
                     .unwrap_or_default();
-                symbols.sort_by_key(|s| self.definition_order(*s));
+                symbols.sort_by_cached_key(|s| self.definition_order(*s));
             } else if linked {
-                // what the query names leads, then what other files use most
+                // what the query names leads, then what other files use most, then the classes they write
+                let class_uses: HashMap<usize, usize> = symbols.iter().map(|s| (*s, self.class_uses(*s))).collect();
+
                 symbols.sort_by(|a, b| {
                     seed_syms
                         .contains(b)
                         .cmp(&seed_syms.contains(a))
                         .then_with(|| sym_rank(*b).total_cmp(&sym_rank(*a)))
+                        .then_with(|| class_uses.get(b).cmp(&class_uses.get(a)))
                         .then_with(|| a.cmp(b))
                 });
             } else {
-                symbols.sort_by_key(|s| self.definition_order(*s));
+                // a sheet that uses no other file gets no rank to order by, and neither does what it names
+                symbols.sort_by_cached_key(|s| (!seed_syms.contains(s), self.definition_order(*s)));
+            }
+
+            // a page that shows nothing is left out unless the query names it or uses what the query names
+            if entry.lang == "html"
+                && symbols.is_empty()
+                && !only_pages
+                && !named(file)
+                && !caller_at.contains_key(&file)
+            {
+                continue;
             }
 
             // under a query, a file that is neither named nor a user of it and shows nothing is only noise
             if seeds.is_some() && symbols.is_empty() && !named(file) && !caller_at.contains_key(&file) {
                 continue;
             }
+
+            // a selector written again (under `@media`, or in a list) would take up a line of the few a file gets and
+            // say nothing new
+            let mut selectors = HashSet::new();
+
+            symbols.retain(|s| {
+                !self.is_selector(*s) || self.syms.get(*s).is_none_or(|sym| selectors.insert(sym.name.as_str()))
+            });
 
             let mut block = format!("{}\n", shown(&entry.path));
 
@@ -230,7 +278,7 @@ impl Graph {
                 let _ = writeln!(block, "  {owner}{}", shown(&sym.sig));
             }
 
-            if !out.is_empty() && tokens(&header) + tokens(&out) + tokens(&block) > budget {
+            if !out.is_empty() && tokens(&header) + tokens(&out) + tokens(&block) + note > budget {
                 break;
             }
 
@@ -300,6 +348,11 @@ impl Graph {
                 continue;
             };
 
+            // the classes a file writes do not make it use a stylesheet in the order of the map
+            if self.is_class(ri) {
+                continue;
+            }
+
             for (sym, _) in targets {
                 if let Some(dst) = self.syms.get(*sym).map(|s| s.file)
                     && dst != src
@@ -339,10 +392,11 @@ impl Graph {
     }
 
     /// How a definition is placed among those of its file when nothing ranks them: top-level before members,
-    /// types before functions before constants, then by line.
-    fn definition_order(&self, sym: usize) -> (bool, u8, i64, usize) {
+    /// types before functions before constants, the selectors pages write most before the others and those that
+    /// name no class or id (`*`, `html`, `:root`) last, then by line. The definitions of a `<style>` block come last.
+    fn definition_order(&self, sym: usize) -> impl Ord + use<> {
         let Some(def) = self.syms.get(sym) else {
-            return (true, u8::MAX, 0, sym);
+            return (true, true, u8::MAX, Reverse(0), true, 0, sym);
         };
         let rank = if TYPE_KINDS.contains(&def.kind.as_str()) {
             0
@@ -354,7 +408,16 @@ impl Graph {
             3
         };
 
-        (def.parent.is_some(), rank, def.line, sym)
+        // the styles of a component come after the code of its script
+        (
+            def.style,
+            def.parent.is_some(),
+            rank,
+            Reverse(self.class_uses(sym)),
+            self.is_generic_selector(sym),
+            def.line,
+            sym,
+        )
     }
 
     /// The path prefix `focus` means among the indexed files, or `None` when no file is under it. Written
@@ -373,6 +436,11 @@ impl Graph {
 
         while let Some(rest) = written.strip_prefix("./") {
             written = rest.to_string();
+        }
+
+        // the project itself
+        if written == "." {
+            written.clear();
         }
 
         let root = self.root.replace('\\', "/");
@@ -400,30 +468,50 @@ impl Graph {
     /// Where `query` is defined (`name`, `Type::name`, `module::name` or `path/fragment::name`), what it
     /// uses and who uses it. At most `limit` entries per list.
     pub fn symbol(&self, query: &str, limit: usize) -> String {
-        let cap = limit.clamp(1, 50);
-        let query = query.trim();
-
-        if let Some(note) = self.left_out_note(query) {
+        // a file the index left out is told on its own, and that says the rest
+        if let Some(note) = self.left_out_note(query.trim()) {
             return note;
         }
 
+        // `used by 0` can be false when a file `.gitattributes` marks generated holds the caller
+        let answer = self.symbol_of(query, limit);
+        let selectors = self.selectors_note(query, &answer);
+        let answer = self.with_attributes_note(answer);
+
+        if selectors.is_empty() {
+            return answer;
+        }
+
+        let mut answer = answer;
+
+        if !answer.ends_with('\n') {
+            answer.push('\n');
+        }
+
+        answer + &selectors
+    }
+
+    fn symbol_of(&self, query: &str, limit: usize) -> String {
+        let cap = limit.clamp(1, 50);
+        let query = query.trim();
         let end = self.endpoint(query, usize::MAX);
         let reading = end.reading;
         let mut defs = end.syms;
 
         if defs.is_empty() {
+            // a file that is indexed but defines nothing (a page without styles) is answered, not guessed at
+            if reading == Reading::File
+                && let Some(note) = end.note
+            {
+                return note;
+            }
+
             return self.suggest(query);
         }
 
         // a file or a string stands for many definitions: the most used ones come first (words are ranked)
         if matches!(reading, Reading::File | Reading::Text) {
-            defs.sort_by_key(|sym| {
-                (
-                    self.syms.get(*sym).is_some_and(|s| s.test),
-                    std::cmp::Reverse(self.incoming.get(*sym).map_or(0, Vec::len)),
-                    *sym,
-                )
-            });
+            defs.sort_by_cached_key(|sym| (self.syms.get(*sym).is_some_and(|s| s.test), self.use_rank(*sym), *sym));
         }
 
         let mut out = String::new();
@@ -484,10 +572,17 @@ impl Graph {
         let mut seen = HashSet::new();
         let mut uses: Vec<(usize, f32, usize)> = Vec::new();
 
-        for &ri in self.outgoing.get(def).map(Vec::as_slice).unwrap_or(&[]) {
-            for (target, weight) in self.res.get(ri).map(Vec::as_slice).unwrap_or(&[]) {
-                if *target != def && seen.insert(*target) {
-                    uses.push((*target, *weight, ri));
+        // the selectors a class names come after what the code calls: there are many of them and they say less
+        for classes in [false, true] {
+            for &ri in self.outgoing.get(def).map(Vec::as_slice).unwrap_or(&[]) {
+                if self.is_class(ri) != classes {
+                    continue;
+                }
+
+                for (target, weight) in self.res.get(ri).map(Vec::as_slice).unwrap_or(&[]) {
+                    if *target != def && seen.insert(*target) {
+                        uses.push((*target, *weight, ri));
+                    }
                 }
             }
         }
@@ -577,7 +672,11 @@ impl Graph {
                 *tests.entry(file.path.as_str()).or_default() += 1;
             } else {
                 let who = r.from.map_or_else(|| "<module>".to_string(), |s| self.label(s));
-                let tag = if r.kind == "str" { " (by name)" } else { "" };
+                let tag = match r.kind.as_str() {
+                    "str" => " (by name)",
+                    "cls" => " (class)",
+                    _ => "",
+                };
                 let mark = if weight < 1.0 { " ?" } else { "" };
 
                 production.push((format!("{}:{} {who}{tag}{mark}", shown(&file.path), r.line), ri));
@@ -625,31 +724,50 @@ impl Graph {
 
             let _ = writeln!(out, "    tests: {}{more}", list.join(", "));
         }
+
+        // how far the count of a selector can be trusted: apart from the sites, so no line reads as one
+        for note in self.class_notes(def, production.len() + test_total) {
+            let _ = writeln!(out, "  {note}");
+        }
     }
 
     /// Everything that transitively uses `query`, up to `depth` caller hops; ambiguous edges are not
     /// followed. Entries read `caller → what it calls`.
     pub fn impact(&self, query: &str, depth: usize) -> String {
-        let depth = depth.clamp(1, 4);
-        let query = query.trim();
-
-        if let Some(note) = self.left_out_note(query) {
+        // a file the index left out is told on its own, and that says the rest
+        if let Some(note) = self.left_out_note(query.trim()) {
             return note;
         }
+
+        let answer = self.impact_of(query, depth);
+
+        self.with_attributes_note(answer)
+    }
+
+    fn impact_of(&self, query: &str, depth: usize) -> String {
+        let depth = depth.clamp(1, 4);
+        let query = query.trim();
 
         let end = self.endpoint(query, usize::MAX);
         let (reading, note) = (end.reading, end.note);
         let start = end.syms;
 
         if start.is_empty() {
+            // a file that is indexed but defines nothing has no users to follow
+            if reading == Reading::File
+                && let Some(note) = note
+            {
+                return note;
+            }
+
             return self.suggest(query);
         }
 
         let mut dist: HashMap<usize, usize> = start.iter().map(|s| (*s, 0)).collect();
-        // how each caller was reached: (callee, through a string name)
-        let mut via: HashMap<usize, (usize, bool)> = HashMap::new();
-        // (file, depth, callee) for references made outside any definition
-        let mut module_users: Vec<(usize, usize, usize)> = Vec::new();
+        // how each caller was reached: (callee, through a string name, through a class name alone)
+        let mut via: HashMap<usize, (usize, bool, bool)> = HashMap::new();
+        // (file, depth, callee, through a class name alone) for references made outside any definition
+        let mut module_users: Vec<(usize, usize, usize, bool)> = Vec::new();
         let mut skipped = 0_usize;
         let mut queue: VecDeque<usize> = start.iter().copied().collect();
 
@@ -670,15 +788,27 @@ impl Graph {
                     continue;
                 };
 
+                // a class that only the name links (`?` in `code_symbol`) is no certain use: the line says so
+                let by_class_name = r.kind == "cls" && self.weight(ri, sym) < 1.0;
+
                 match r.from {
-                    Some(caller) => {
-                        if let std::collections::hash_map::Entry::Vacant(slot) = dist.entry(caller) {
+                    Some(caller) => match dist.entry(caller) {
+                        std::collections::hash_map::Entry::Vacant(slot) => {
                             slot.insert(here + 1);
-                            via.insert(caller, (sym, r.kind == "str"));
+                            via.insert(caller, (sym, r.kind == "str", by_class_name));
                             queue.push_back(caller);
                         }
-                    }
-                    None => module_users.push((r.file, here + 1, sym)),
+                        // the same caller at the same depth through a certain link is told by that one
+                        std::collections::hash_map::Entry::Occupied(seen) => {
+                            if *seen.get() == here + 1
+                                && !by_class_name
+                                && via.get(&caller).is_some_and(|(_, _, uncertain)| *uncertain)
+                            {
+                                via.insert(caller, (sym, r.kind == "str", false));
+                            }
+                        }
+                    },
+                    None => module_users.push((r.file, here + 1, sym, by_class_name)),
                 }
             }
         }
@@ -711,24 +841,29 @@ impl Graph {
 
             entry.0 = entry.0.min(*d);
             entry.1.push(match via.get(sym) {
-                Some((callee, by_name)) => format!(
-                    "{} → {}{}",
+                Some((callee, by_name, by_class_name)) => format!(
+                    "{} → {}{}{}",
                     self.label(*sym),
                     if *by_name { "by name " } else { "" },
-                    self.label(*callee)
+                    self.label(*callee),
+                    if *by_class_name { " ?" } else { "" }
                 ),
                 None => self.label(*sym),
             });
         }
 
-        for (file, d, callee) in module_users {
+        for (file, d, callee, by_class_name) in module_users {
             let is_test = self.files.get(file).is_some_and(|f| f.test);
 
             by_file
                 .entry((is_test, file))
                 .or_insert_with(|| (d, Vec::new()))
                 .1
-                .push(format!("<module> → {}", self.label(callee)));
+                .push(format!(
+                    "<module> → {}{}",
+                    self.label(callee),
+                    if by_class_name { " ?" } else { "" }
+                ));
         }
 
         let mut rows: Vec<(usize, &str, Vec<String>, bool)> = by_file

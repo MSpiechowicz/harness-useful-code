@@ -186,6 +186,7 @@ pub(super) fn extract(parser: &mut Parser, lang: &'static TagLang, src: &str, ou
                 sig: first_line(node, bytes),
                 ret: None,
                 test: false,
+                style: false,
             });
 
             // what is inside a definition that was not kept belongs to the one around it, or to none
@@ -230,6 +231,8 @@ pub(super) fn extract(parser: &mut Parser, lang: &'static TagLang, src: &str, ou
                     recv,
                     line,
                     handler: false,
+                    style: false,
+                    markup: false,
                 },
             ));
         }
@@ -287,6 +290,8 @@ pub(super) fn extract(parser: &mut Parser, lang: &'static TagLang, src: &str, ou
                         recv: None,
                         line: node.start_position().row + 1,
                         handler: false,
+                        style: false,
+                        markup: false,
                     },
                 ));
             }
@@ -310,6 +315,8 @@ pub(super) fn extract(parser: &mut Parser, lang: &'static TagLang, src: &str, ou
                         line: field.start_position().row + 1,
                         // `case events.EvtNew:` mentions a constant of the package, which reads like a call
                         handler: super::handled(field, bytes),
+                        style: false,
+                        markup: false,
                     },
                 ));
             }

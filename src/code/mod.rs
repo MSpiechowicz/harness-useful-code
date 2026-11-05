@@ -6,7 +6,9 @@
 //! when the repository's generation moved. There is no watcher and no rebuild command.
 //!
 //! - [`walk`]: the bounded, link-safe walk and the safe read.
-//! - [`extract`]: definitions, references and imports per file, with tree-sitter.
+//! - [`extract`]: definitions, references and imports per file, with tree-sitter. Stylesheets (CSS, SCSS, Sass,
+//!   Less, and the `<style>` blocks of components) are read for selectors and tokens, and the class names that
+//!   components and pages write are kept to link to those selectors (see `graph::classes`).
 //! - [`store`]: the schema and the writes.
 //! - `packages`: crate names, Go modules and TypeScript path aliases.
 //! - [`graph`]: resolution, ranking and the text the agent reads.

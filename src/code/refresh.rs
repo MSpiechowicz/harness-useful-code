@@ -105,8 +105,8 @@ fn stale(entries: &[Entry], known: &Known) -> bool {
             .any(|entry| known.files.get(&entry.rel).is_none_or(|stamp| stamp.differs(entry)))
 }
 
-/// What the walk saw: the digest of every file's path, modification time and size, in path order. The
-/// same files give the same value.
+/// What the walk saw: the digest of every file's path, modification time, size and `linguist-generated` mark,
+/// in path order. The same files give the same value.
 fn fingerprint(entries: &[Entry]) -> String {
     let mut bytes = Vec::with_capacity(entries.len() * 48);
 
@@ -115,6 +115,7 @@ fn fingerprint(entries: &[Entry]) -> String {
         bytes.push(0);
         bytes.extend_from_slice(&entry.mtime_ns.to_le_bytes());
         bytes.extend_from_slice(&entry.size.to_le_bytes());
+        bytes.push(u8::from(entry.attr_generated));
     }
 
     digest_hex(&bytes)
@@ -231,7 +232,8 @@ pub(super) fn start(
             return Err(TOO_LARGE.into());
         }
 
-        if !stale(&walked.entries, &known) {
+        // a change in the pages left out changes what a selector's users are, though no file did
+        if !stale(&walked.entries, &known) && known.pages_cut == walked.pages_cut {
             store.touch(known.repo, known.used_at);
 
             current = Some(Current {
@@ -392,12 +394,19 @@ fn locked(
         if started.is_none() {
             if plan.is_empty() {
                 // another process did the work while this one waited for the lock
+                if txn.set_pages_cut(repo, walked.pages_cut)? {
+                    txn.bump(repo)?;
+                }
+
                 txn.clear_marks(repo)?;
+
+                let generation = txn.generation(repo)?;
+
                 txn.finish()?;
 
                 return Ok(Outcome {
                     repo,
-                    generation: known.generation,
+                    generation,
                     refresh: Refresh {
                         checked: walked.entries.len(),
                         skipped: walked.skipped,
@@ -492,6 +501,11 @@ fn locked(
     let found = packages::collect(root, &walked.entries, pace)?;
 
     if txn.set_packages(repo, &found, &packages::digest(&found))? {
+        work.wrote = true;
+    }
+
+    // the pages left out change what a selector's users are, though no file of the index did
+    if txn.set_pages_cut(repo, walked.pages_cut)? {
         work.wrote = true;
     }
 

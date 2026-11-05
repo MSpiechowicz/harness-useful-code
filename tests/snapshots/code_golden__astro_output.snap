@@ -15,7 +15,7 @@ Next: code_symbol for where a name above is defined and who uses it, code_impact
 component Layout  src/layouts/Layout.astro:1-12
   <Layout>
   used by 1 site(s):
-    src/pages/index.astro:8 index | <Layout title="…">
+    src/pages/index.astro:8 index
 
 == symbol getPosts
 fn getPosts  src/lib/posts.ts:5-7

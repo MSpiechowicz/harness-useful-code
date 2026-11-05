@@ -603,6 +603,22 @@ fn the_worker_records_how_big_the_graph_it_validated_is_and_a_graph_past_the_cap
     assert!(!is_error(&answered), "{answered}");
 }
 
+/// The deepest file the size limit allows (`{a:` a quarter of a million times) overflows the stack of the C parser
+/// on a thread of the usual size: the worker died, and with it the answer for every healthy file. The extraction
+/// runs on a thread with a stack of its own, so the healthy file stays indexed.
+#[test]
+fn a_file_nested_past_the_stack_of_the_parser_does_not_cost_the_repository_its_other_files() {
+    let machine = Machine::new();
+
+    std::fs::write(machine.repo.join("src/deep.ts"), "{a:\n".repeat(249_000)).expect("deep");
+
+    let mut server = machine.server(&[]);
+    let reply = machine.symbol(&mut server);
+
+    assert!(!is_error(&reply), "{reply}");
+    assert!(text(&reply).contains("src/lib.rs"), "{}", text(&reply));
+}
+
 #[test]
 fn a_repository_the_index_holds_at_a_validated_generation_needs_no_worker() {
     let machine = Machine::new();
