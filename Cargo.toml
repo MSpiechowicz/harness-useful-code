@@ -65,6 +65,15 @@ unsafe_code = "forbid"
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 
+# The parsers are C, built at -O0 otherwise, and every test that reads a file waits for them: hostile inputs took long
+# enough to hit the limits they check, on a slow runner. A little optimisation does the same for our own code, which
+# keeps its debug assertions and overflow checks.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 strip = true

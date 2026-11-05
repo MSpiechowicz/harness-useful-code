@@ -1,0 +1,48 @@
+# Tests that assert on wall-clock time, or that race a real budget, cannot pass on a runner whose CPUs the rest of the
+# suite is using. They run one at a time. A repeat covers a noisy shared runner: a real slowdown, such as a walk gone
+# quadratic, fails every try, and nextest reports one that passed on a repeat as flaky. A new test that measures time
+# belongs in this list.
+[[profile.default.overrides]]
+filter = '''
+  test(~a_cancel_ends_the_class_pass_at_once) |
+  test(~a_cancelled_call_kills_its_worker_and_does_not_mark_the_repository) |
+  test(~a_chain_of_a_thousand_nested_folders_with_an_ignore_file_each_is_cheap_on_every_call) |
+  test(~a_chain_of_repeated_reexports_is_searched_once_per_module) |
+  test(~a_class_pass_that_runs_out_of_its_time_does_not_fail_the_index_that_the_worker_validates) |
+  test(~a_component_with_thousands_of_script_blocks_stops_at_the_deadline) |
+  test(~a_file_cut_off_deep_inside_a_call_is_read_in_linear_time) |
+  test(~a_file_of_a_hundred_thousand_empty_style_blocks_is_read_quickly) |
+  test(~a_file_of_many_empty_style_blocks_and_class_attributes_is_read_quickly) |
+  test(~a_file_of_many_script_blocks_is_read_in_linear_time) |
+  test(~a_file_works_out_no_more_than_its_budget_of_names_and_counts_the_rest) |
+  test(~a_folder_of_more_files_than_the_cap_at_a_long_path_is_refused_without_holding_them) |
+  test(~a_hanging_command_is_killed_at_the_timeout) |
+  test(~a_hint_is_quick_and_exits_zero_whatever_the_answer_and_two_for_wrong_arguments) |
+  test(~a_hub_of_thousands_of_imports_is_resolved_once_not_once_per_file_that_uses_a_class) |
+  test(~a_line_of_unclosed_quotes_in_a_brace_is_read_in_linear_time) |
+  test(~a_load_out_of_time_inside_the_class_pass_keeps_its_graph_and_reports_the_uses_as_unread) |
+  test(~a_megabyte_is_read_far_inside_the_time_a_file_gets) |
+  test(~a_ranking_that_runs_past_its_time_is_given_up_instead_of_finishing) |
+  test(~a_refresh_past_its_time_budget_fails_and_the_next_call_goes_on) |
+  test(~a_selector_list_inside_a_list_builds_no_more_names_than_the_file_can_keep) |
+  test(~a_session_that_waits_for_the_lock_gets_a_turn_from_a_build_that_yields) |
+  test(~a_shared_base_config_is_read_once_however_many_configs_extend_it) |
+  test(~a_worker_past_its_deadline_is_killed_and_answered_with_the_limits_error) |
+  test(~an_ampersand_written_many_times_builds_no_name_past_the_longest_and_the_file_has_one_budget) |
+  test(~deeply_nested_and_endlessly_repeated_types_are_read_at_once) |
+  test(~eighty_thousand_self_calling_functions_of_one_name_make_no_edges_and_finish_fast) |
+  test(~hostile_constants_are_read_within_their_budgets) |
+  test(~hostile_markup_is_read_in_linear_time_without_a_panic) |
+  test(~hundreds_of_folders_with_a_megabyte_ignore_file_each_do_not_exhaust_the_memory) |
+  test(~ignore_files_full_of_wildcards_cost_the_server_little_memory_on_every_call) |
+  test(~imports_that_resolve_to_the_same_sixteen_sheets_are_walked_once_not_once_per_spelling) |
+  test(~nested_ignore_files_of_a_megabyte_each_with_thousands_of_patterns_stay_within_the_memory) |
+  test(~one_class_redefined_many_times_and_a_hub_calling_its_base_keep_a_search_without_chain_quick) |
+  test(~sigterm_ends_a_server_that_is_busy_in_a_call_that_does_not_look_at_it) |
+  test(~the_second_session_serves_the_last_committed_graph_while_the_first_holds_the_lock) |
+  test(~the_walk_alone_is_held_to_the_time_budget) |
+  test(~thousands_of_subclasses_of_one_base_and_a_chain_of_bases_keep_the_search_bounded) |
+  test(~types_nested_or_repeated_a_hundred_thousand_times_are_read_quickly)
+'''
+threads-required = "num-test-threads"
+retries = 2
