@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "harness_code"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "dunce",
  "ignore",

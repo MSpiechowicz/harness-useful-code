@@ -1,3 +1,10 @@
+## [1.2.2](https://github.com/MSpiechowicz/harness-useful-code/compare/v1.2.1...v1.2.2) (2026-11-05)
+
+
+### Bug Fixes
+
+* **code:** index every stylesheet selector ([68597aa](https://github.com/MSpiechowicz/harness-useful-code/commit/68597aa4d8df30f0a731df3d65aa11393cd2b8e0))
+
 ## [1.2.1](https://github.com/MSpiechowicz/harness-useful-code/compare/v1.2.0...v1.2.1) (2026-11-04)
 
 
