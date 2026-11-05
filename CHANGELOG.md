@@ -1,3 +1,10 @@
+# [1.3.0](https://github.com/MSpiechowicz/harness-useful-code/compare/v1.2.2...v1.3.0) (2026-11-05)
+
+
+### Features
+
+* **code:** link stylesheets to the markup that uses them ([16644bf](https://github.com/MSpiechowicz/harness-useful-code/commit/16644bf70628213ba0f78f3a6917200640c26f72))
+
 ## [1.2.2](https://github.com/MSpiechowicz/harness-useful-code/compare/v1.2.1...v1.2.2) (2026-11-05)
 
 
