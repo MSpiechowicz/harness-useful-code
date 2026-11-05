@@ -951,13 +951,39 @@ fn slow_stop() -> bool {
     false
 }
 
+/// A budget that leaves the stages before the class pass room on this machine and that the class pass cannot finish
+/// in. What those stages cost differs by far between machines: what they do without the slow check, and how long a
+/// slow check really sleeps. The stylesheet lookups alone ask the pace about thirteen hundred times; the stages before
+/// them ask far fewer, so six hundred and fifty checks and twice the plain work fit them and not the lookups.
+fn budget_past_the_stages_before_the_class_pass() -> Duration {
+    let mut twin = hub_fixture(60, 20_000);
+    let root = twin.root().to_path_buf();
+
+    twin.index.set_budget(Duration::from_secs(120));
+
+    let plain = Instant::now();
+
+    twin.index
+        .validate(&root, &|| false, &mut crate::code::builds::NoObserver, &|| {})
+        .expect("the same index without the slow check");
+
+    let plain = plain.elapsed();
+    let checks = Instant::now();
+
+    for _ in 0..50 {
+        slow_stop();
+    }
+
+    plain * 2 + checks.elapsed() * 13
+}
+
 #[test]
 fn a_class_pass_that_runs_out_of_its_time_does_not_fail_the_index_that_the_worker_validates() {
     let mut fixture = hub_fixture(60, 20_000);
     let root = fixture.root().to_path_buf();
+    let budget = budget_past_the_stages_before_the_class_pass();
 
-    // the stylesheet lookups alone ask the pace about thirteen hundred times, which is longer than the budget
-    fixture.index.set_budget(Duration::from_secs(2));
+    fixture.index.set_budget(budget);
 
     let (_, _, counts) = fixture
         .index
@@ -969,7 +995,7 @@ fn a_class_pass_that_runs_out_of_its_time_does_not_fail_the_index_that_the_worke
     // the same load and trial on one pace, as the worker runs them: the uses are counted as unread
     let key = root.to_str().expect("utf-8").to_owned();
     let repo = fixture.index.store.known(&key).expect("known").expect("repo").repo;
-    let pace = Pace::new(&slow_stop, Duration::from_secs(2));
+    let pace = Pace::new(&slow_stop, budget);
     let answer = fixture
         .index
         .store
