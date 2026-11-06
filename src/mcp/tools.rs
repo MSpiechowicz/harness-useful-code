@@ -31,7 +31,8 @@ pub const INSTRUCTIONS: &str = "\
 Code graph of your repository, shared by every coding agent on this machine: where code is defined and who uses it.
 - Before grep: code_map, code_symbol, code_impact, code_path. A to B: code_path (symbol, file, command or words). \
 Grepped for a start? Use code_path from there.
-- ALWAYS pass project_path (absolute git root of your repository).";
+- ALWAYS pass project_path (absolute git root of your repository).
+- A call refused for its arguments: fix them and call the tool again, do not fall back to grep.";
 
 /// Sent in the `initialize` result while the code graph is off.
 pub const INSTRUCTIONS_OFF: &str = "\

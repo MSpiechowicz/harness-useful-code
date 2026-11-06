@@ -156,12 +156,13 @@ impl CodeRootRefusal {
         match self {
             Self::Broad => format!(
                 "project_path {} holds your home folder or is a system folder, which is too big to index. Pass the \
-                 absolute path of the repository you are working in",
+                 absolute path of the repository you are working in and call the tool again.",
                 root.display()
             ),
             Self::HiddenInHome => format!(
                 "project_path {} is a hidden folder of your home folder, where tools keep settings and credentials, \
-                 so the code index does not read it. Pass the absolute path of the repository you are working in",
+                 so the code index does not read it. Pass the absolute path of the repository you are working in and \
+                 call the tool again.",
                 root.display()
             ),
             Self::NotGit => "The code index only works inside a git repository.".to_owned(),

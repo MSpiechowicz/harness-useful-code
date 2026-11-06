@@ -436,10 +436,17 @@ fn a_call_without_a_usable_project_path_is_refused() {
     for arguments in cases {
         let reply = tool(&mut server, "code_symbol", arguments.clone());
         assert!(is_error(&reply), "{arguments}: {reply}");
+        assert!(text(&reply).contains("call the tool again"), "{arguments}: {reply}");
     }
 
     assert!(machine.status_files().is_empty());
-    assert!(is_error(&tool(&mut server, "code_map", json!({}))));
+
+    let no_arguments = tool(&mut server, "code_map", json!({}));
+    assert!(is_error(&no_arguments));
+    assert!(
+        text(&no_arguments).contains("project_path") && text(&no_arguments).contains("call the tool again"),
+        "{no_arguments}"
+    );
     assert!(is_error(&tool(&mut server, "code_impact", json!({ "symbol": "x" }))));
 }
 

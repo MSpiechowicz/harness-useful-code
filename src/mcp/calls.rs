@@ -36,6 +36,12 @@ const REPLY_MAX: usize = 64 * 1024;
 /// The first line of an answer served from what another session committed while it still builds.
 const STALE: &str = "Note: another session is still building this index, so results may be incomplete.";
 
+/// `reason`, a refusal of the arguments, with what the agent does next: an agent told only what is wrong tends to
+/// give up on the tool and go on with grep.
+fn call_again(reason: impl std::fmt::Display) -> String {
+    format!("{reason}. Fix it and call the tool again.")
+}
+
 /// True when the code index is on now: the tools are listed only then.
 pub(super) fn switched_on(server: &Server) -> bool {
     let env = server.projects.env();
@@ -160,7 +166,7 @@ fn end_of<'a>(value: &'a str, name: &str) -> Result<&'a str, String> {
     let value = value.trim();
 
     if value.is_empty() {
-        return Err(format!("{name} must not be empty"));
+        return Err(call_again(format!("{name} must not be empty")));
     }
 
     short_enough(name, value)
@@ -185,7 +191,7 @@ fn query_of(symbol: &str) -> Result<&str, String> {
     let query = symbol.trim();
 
     if query.is_empty() {
-        return Err("symbol must not be empty".to_owned());
+        return Err(call_again("symbol must not be empty"));
     }
 
     short_enough("symbol", query)
@@ -193,7 +199,9 @@ fn query_of(symbol: &str) -> Result<&str, String> {
 
 fn short_enough<'a>(name: &str, value: &'a str) -> Result<&'a str, String> {
     if value.chars().count() > QUERY_CHARS_MAX {
-        return Err(format!("{name} is longer than {QUERY_CHARS_MAX} characters"));
+        return Err(call_again(format!(
+            "{name} is longer than {QUERY_CHARS_MAX} characters"
+        )));
     }
 
     Ok(value)
@@ -207,17 +215,20 @@ fn answer(
     render: impl FnOnce(&Graph) -> String,
 ) -> Result<String, String> {
     if project_path.trim().is_empty() {
-        return Err("project_path is required: pass the absolute path of the repository you are working in".to_owned());
+        return Err(call_again(
+            "project_path is required: pass the absolute path of the repository you are working in",
+        ));
     }
 
     let root = server
         .projects
         .resolve(Some(project_path))
-        .map_err(|reason| format!("{reason} (got {project_path:?})"))?
+        .map_err(|reason| call_again(format!("{reason} (got {project_path:?})")))?
         .ok_or_else(|| {
-            "project_path names the home folder or a filesystem root, which is too big to index. Pass the absolute \
-             path of the repository you are working in"
-                .to_owned()
+            call_again(
+                "project_path names the home folder or a filesystem root, which is too big to index. Pass the \
+                 absolute path of the repository you are working in",
+            )
         })?
         .root;
 
@@ -308,9 +319,12 @@ fn cut(text: &mut String) {
     text.push_str("\n… (cut)");
 }
 
-/// The arguments of a call as `T`; the message tells the agent to check the tool's schema.
+/// The arguments of a call as `T`; the message tells the agent to check the tool's schema and call it again.
 fn parse<T: DeserializeOwned>(arguments: Value) -> Result<T, String> {
     serde_json::from_value(arguments).map_err(|error| {
-        format!("invalid arguments: {error}. Check the tool's input schema in tools/list for the required fields")
+        format!(
+            "invalid arguments: {error}. Check the tool's input schema in tools/list for the required fields, then \
+             call the tool again with them. project_path is the absolute git root of your repository."
+        )
     })
 }
