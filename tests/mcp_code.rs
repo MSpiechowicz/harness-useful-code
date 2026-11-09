@@ -199,7 +199,7 @@ fn the_tools_are_listed_while_the_index_is_on_and_hidden_while_it_is_off() {
 }
 
 #[test]
-fn the_tool_schemas_require_a_project_path_and_stay_short() {
+fn the_tool_schemas_require_their_fields_and_stay_short() {
     let machine = Machine::new();
     let mut server = machine.server(&[]);
     let reply = run(
@@ -217,7 +217,7 @@ fn the_tool_schemas_require_a_project_path_and_stay_short() {
     };
 
     for (name, required, bounded) in [
-        ("code_map", json!(["project_path"]), ("budget", 200, 4000)),
+        ("code_map", json!([]), ("budget", 200, 4000)),
         ("code_symbol", json!(["project_path", "symbol"]), ("limit", 1, 50)),
         ("code_impact", json!(["project_path", "symbol"]), ("depth", 1, 4)),
         ("code_path", json!(["project_path", "from", "to"]), ("max_depth", 1, 10)),

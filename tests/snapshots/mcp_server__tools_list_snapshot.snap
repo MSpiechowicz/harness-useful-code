@@ -28,9 +28,7 @@ expression: "reply[\"result\"]"
             "description": "Size of the map in tokens, 200 to 4000 (a value outside is cut to the nearest end)"
           }
         },
-        "required": [
-          "project_path"
-        ],
+        "required": [],
         "additionalProperties": false
       },
       "_meta": {

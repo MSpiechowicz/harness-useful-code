@@ -74,7 +74,7 @@ fn code_map() -> Value {
                 &format!("Size of the map in tokens, {MAP_BUDGET_MIN} to {MAP_BUDGET_MAX}"),
             ),
         }),
-        &["project_path"],
+        &[],
     )
 }
 
