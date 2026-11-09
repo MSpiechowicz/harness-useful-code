@@ -1,3 +1,11 @@
+## [1.3.3](https://github.com/MSpiechowicz/harness-useful-code/compare/v1.3.2...v1.3.3) (2026-11-09)
+
+
+### Bug Fixes
+
+* **deps:** update rusqlite to 0.41 for the bundled SQLite 3.54 fix (RUSTSEC-2026-0459) ([34faa70](https://github.com/MSpiechowicz/harness-useful-code/commit/34faa70e355c773fbab9e715f3ccc7c1446bad2a))
+* **mcp:** make project_path optional in the code_map schema ([c7f5400](https://github.com/MSpiechowicz/harness-useful-code/commit/c7f5400fa9c85ba7c8bf6614281691619883ef3a))
+
 ## [1.3.2](https://github.com/MSpiechowicz/harness-useful-code/compare/v1.3.1...v1.3.2) (2026-11-09)
 
 
