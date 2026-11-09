@@ -106,7 +106,7 @@ fn a_tool_that_does_not_exist_and_a_method_that_does_not_exist_are_errors() {
 }
 
 #[test]
-fn a_call_without_a_project_path_is_a_tool_error_that_says_what_is_missing() {
+fn a_call_without_a_project_path_in_the_home_folder_is_a_tool_error_that_says_what_is_missing() {
     let dir = TempDir::new().expect("temp");
     let mut client = started(&dir, &[]);
     let reply = client.request("tools/call", json!({ "name": "code_map", "arguments": {} }));

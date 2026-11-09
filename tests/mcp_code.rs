@@ -417,9 +417,7 @@ fn a_call_without_a_usable_project_path_is_refused() {
     let nowhere = machine.dir.path().join("does-not-exist");
 
     let cases = [
-        json!({ "symbol": "compute_total" }),
-        json!({ "project_path": "", "symbol": "compute_total" }),
-        json!({ "project_path": "   ", "symbol": "compute_total" }),
+        json!({ "project_path": { "path": "/somewhere" }, "symbol": "compute_total" }),
         json!({ "project_path": "relative/dir", "symbol": "compute_total" }),
         json!({ "project_path": home.to_string_lossy(), "symbol": "compute_total" }),
         json!({ "project_path": nowhere.to_string_lossy(), "symbol": "compute_total" }),
@@ -440,14 +438,26 @@ fn a_call_without_a_usable_project_path_is_refused() {
     }
 
     assert!(machine.status_files().is_empty());
+}
 
-    let no_arguments = tool(&mut server, "code_map", json!({}));
-    assert!(is_error(&no_arguments));
-    assert!(
-        text(&no_arguments).contains("project_path") && text(&no_arguments).contains("call the tool again"),
-        "{no_arguments}"
-    );
-    assert!(is_error(&tool(&mut server, "code_impact", json!({ "symbol": "x" }))));
+#[test]
+fn an_empty_project_path_means_the_repository_the_server_runs_in() {
+    let machine = Machine::new();
+    let mut server = machine.server(&[]);
+
+    for arguments in [
+        json!({ "symbol": "compute_total" }),
+        json!({ "project_path": "", "symbol": "compute_total" }),
+        json!({ "project_path": "   ", "symbol": "compute_total" }),
+        json!({ "project_path": {}, "symbol": "compute_total" }),
+        json!({ "project_path": null, "symbol": "compute_total" }),
+    ] {
+        let reply = tool(&mut server, "code_symbol", arguments.clone());
+        assert!(!is_error(&reply), "{arguments}: {reply}");
+        assert!(text(&reply).contains("compute_total"), "{arguments}: {reply}");
+    }
+
+    assert!(!is_error(&tool(&mut server, "code_map", json!({}))));
 }
 
 #[test]

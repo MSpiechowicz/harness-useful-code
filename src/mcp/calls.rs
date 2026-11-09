@@ -52,6 +52,7 @@ pub(super) fn switched_on(server: &Server) -> bool {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MapArgs {
+    #[serde(default)]
     project_path: String,
     focus: Option<String>,
     query: Option<String>,
@@ -61,6 +62,7 @@ struct MapArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SymbolArgs {
+    #[serde(default)]
     project_path: String,
     symbol: String,
     limit: Option<i64>,
@@ -69,6 +71,7 @@ struct SymbolArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ImpactArgs {
+    #[serde(default)]
     project_path: String,
     symbol: String,
     depth: Option<i64>,
@@ -77,6 +80,7 @@ struct ImpactArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PathArgs {
+    #[serde(default)]
     project_path: String,
     from: String,
     to: String,
@@ -207,27 +211,23 @@ fn short_enough<'a>(name: &str, value: &'a str) -> Result<&'a str, String> {
     Ok(value)
 }
 
-/// Refreshes the index of the repository `project_path` names and renders its graph with `render`.
+/// Refreshes the index of the repository `project_path` names (when it is empty, the one the server runs in) and
+/// renders its graph with `render`.
 fn answer(
     server: &mut Server,
     tool: &str,
     project_path: &str,
     render: impl FnOnce(&Graph) -> String,
 ) -> Result<String, String> {
-    if project_path.trim().is_empty() {
-        return Err(call_again(
-            "project_path is required: pass the absolute path of the repository you are working in",
-        ));
-    }
-
     let root = server
         .projects
         .resolve(Some(project_path))
         .map_err(|reason| call_again(format!("{reason} (got {project_path:?})")))?
         .ok_or_else(|| {
             call_again(
-                "project_path names the home folder or a filesystem root, which is too big to index. Pass the \
-                 absolute path of the repository you are working in",
+                "project_path is empty and the server runs outside a repository, or it names the home folder or a \
+                 filesystem root, which is too big to index. Pass the absolute path of the repository you are \
+                 working in",
             )
         })?
         .root;
