@@ -1,7 +1,7 @@
 [package]
 name = "harness_code"
 description = "Code graph MCP server for any coding agent harness (embedded SQLite, tree-sitter)"
-version = "1.3.1"
+version = "1.3.2"
 edition = "2024"
 rust-version = "1.98"
 license = "GPL-3.0-or-later"
